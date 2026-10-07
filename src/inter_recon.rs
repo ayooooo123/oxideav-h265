@@ -199,7 +199,7 @@ pub fn reconstruct_inter_cu(
     let snapshot: Option<Picture> = needs_curr.then(|| pic.clone());
 
     for (rect, motion) in rects.iter().zip(motions.iter()) {
-        let l0 = resolve_list(
+        let l0 = match resolve_list(
             params,
             refs,
             snapshot.as_ref(),
@@ -207,7 +207,25 @@ pub fn reconstruct_inter_cu(
             motion.pred_flag_l0,
             motion.ref_idx_l0,
             motion.mv_l0,
-        )?;
+        ) {
+            Ok(l0) => l0,
+            Err(e) => {
+                // An unused L0 with no picture to stand in must not hide
+                // a used L1's missing reference (every reference cleared).
+                if !motion.pred_flag_l0 && motion.pred_flag_l1 {
+                    resolve_list(
+                        params,
+                        refs,
+                        snapshot.as_ref(),
+                        1,
+                        true,
+                        motion.ref_idx_l1,
+                        motion.mv_l1,
+                    )?;
+                }
+                return Err(e);
+            }
+        };
         let l1 = resolve_list(
             params,
             refs,
@@ -2588,5 +2606,82 @@ mod tests {
         // The P picture's motion field records the inter CU (for a future
         // picture's temporal MVP).
         assert!(!seq.dpb().entries()[1].motion.cell_at(16, 16).is_intra);
+    }
+
+    /// A used reference that is "no reference picture" reports
+    /// [`ReconError::MissingReference`] whichever list uses it, also for
+    /// an L1-only PU whose unused L0 has no picture to stand in either
+    /// (every reference cleared, as after an SPS change). An L1-only PU
+    /// with its reference present still decodes.
+    #[test]
+    fn a_missing_used_reference_is_reported_whichever_list_uses_it() {
+        let params = p_params();
+        let pu = PredictionUnit {
+            merge_flag: true,
+            merge_idx: Some(0),
+            inter_pred_idc: None,
+            ref_idx_l0: None,
+            mvd_l0: None,
+            mvp_l0_flag: None,
+            ref_idx_l1: None,
+            mvd_l1: None,
+            mvp_l1_flag: None,
+        };
+        let cu = inter_cu_16(pu, None);
+        let rect = PuRect {
+            x_pb: 0,
+            y_pb: 0,
+            n_pb_w: 16,
+            n_pb_h: 16,
+        };
+        let missing = RefPicLists {
+            list0: vec![None],
+            list1: Some(vec![None]),
+        };
+        let no_entries: Vec<DpbEntry> = Vec::new();
+        let refs = RefListAccess {
+            lists: &missing,
+            entries: &no_entries,
+        };
+        for (l0, l1) in [(true, false), (false, true), (true, true)] {
+            let motion = PuMotion {
+                pred_flag_l0: l0,
+                pred_flag_l1: l1,
+                ..PuMotion::default()
+            };
+            let mut pic = Picture::new(16, 16, 1, 8, 8);
+            let result =
+                reconstruct_inter_cu(&mut pic, &params, &cu, &[rect], &[motion], 26, &refs, None);
+            assert_eq!(
+                result,
+                Err(ReconError::MissingReference),
+                "L0 {l0}, L1 {l1}"
+            );
+        }
+
+        let entries = vec![DpbEntry {
+            poc: 0,
+            layer_id: 0,
+            marking: Marking::ShortTerm,
+            picture: Picture::new(16, 16, 1, 8, 8),
+            motion: MotionField::new(16, 16),
+        }];
+        let present = RefPicLists {
+            list0: vec![None],
+            list1: Some(vec![Some(0)]),
+        };
+        let refs = RefListAccess {
+            lists: &present,
+            entries: &entries,
+        };
+        let motion = PuMotion {
+            pred_flag_l1: true,
+            ..PuMotion::default()
+        };
+        let mut pic = Picture::new(16, 16, 1, 8, 8);
+        assert_eq!(
+            reconstruct_inter_cu(&mut pic, &params, &cu, &[rect], &[motion], 26, &refs, None),
+            Ok(())
+        );
     }
 }

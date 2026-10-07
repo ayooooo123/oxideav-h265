@@ -69,12 +69,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 - A picture that activates a changed SPS (another id, or the same id
   re-sent with other bytes) now first marks its layer's reference pictures
-  unused, as FFmpeg does; re-sending the same bytes keeps them. A P or B
-  picture whose RPS still names a picture coded under the old SPS now
-  fails with `ReconError::MissingReference` (FFmpeg 9.0.2 also drops it:
-  "Could not find ref with POC"), where before it predicted from a picture
-  of another size or bit depth. A missing used reference was reported as
-  `InterNotSupported` ("not reconstructed by the intra path") before.
+  unused, as FFmpeg does; re-sending the same bytes keeps them. Bytes are
+  compared over FFmpeg's span: the RBSP without trailing zero bytes, the
+  stop bit and the zero bits after it, rounded up to bytes (so a final
+  `0x80` byte is no change). A P or B picture whose RPS still names a
+  picture coded under the old SPS now fails with
+  `ReconError::MissingReference` (FFmpeg 9.0.2 also drops it: "Could not
+  find ref with POC"), where before it predicted from a picture of another
+  size or bit depth. A missing used reference was reported as
+  `InterNotSupported` ("not reconstructed by the intra path") before, and
+  an L1-only prediction whose unused L0 had no picture still was.
+- A VPS re-sent with other bytes now drops the SPS parsed against it, as
+  FFmpeg does; re-sending the same bytes keeps them. An SPS re-sent
+  unchanged after it is parsed again, so a non-base layer's SPS takes its
+  inferred ordering limits from the new VPS; before, it kept the old
+  VPS's reorder bound.
+- The §8.3.2 long-term reference lookup no longer picks a picture already
+  marked unused for reference. Before, a picture cleared on an SPS change
+  (or by an IRAP) and not yet evicted (a non-base layer, mid access unit)
+  could be picked and marked long-term again.
 - A used reference picture must also have the current picture's chroma
   format and bit depths, or prediction fails with
   `InterPredError::ReferenceFormatMismatch`. Before, a 10-bit reference of
@@ -88,9 +101,10 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   directly supplied offset outside `−1023..=1023` takes the 32-bit path.
 - `tests/hostile_parameter_sets.rs` decodes these cases with both kernel
   sets and requires an error: an 8-bit SPS, PPS and P slice after a 10-bit
-  IDR or after a 32×32 IDR of the same format; PPS SAO scales of 1 and 31
-  on an 8-bit stream. An unchanged re-sent SPS and in-range scales still
-  decode exactly.
+  IDR or after a 32×32 IDR of the same format; a changed VPS before the
+  same SPS, PPS and P slice; PPS SAO scales of 1 and 31 on an 8-bit stream.
+  An unchanged re-sent VPS or SPS, an SPS re-sent with a final `0x80` or
+  trailing zero bytes, and in-range scales still decode exactly.
 
 ## [0.0.14](https://github.com/OxideAV/oxideav-h265/compare/v0.0.13...v0.0.14) - 2026-10-01
 

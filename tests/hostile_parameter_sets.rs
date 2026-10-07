@@ -218,3 +218,105 @@ fn sao_offset_scales_beyond_the_bit_depth_bound_are_decode_errors() {
         assert_eq!(result.expect("in-range SAO offset scales"), expected);
     }
 }
+
+/// The fixture's IDR, VPS, SPS, PPS and P slice, and its decode.
+struct Fixture {
+    units: Vec<NalUnit>,
+    idr: u8,
+    expected: Vec<Vec<u8>>,
+}
+
+fn i_then_p() -> Fixture {
+    let units = units(I_THEN_P_HEVC);
+    let idr = units
+        .iter()
+        .find(|u| matches!(u.header.nal_unit_type, IDR_W_RADL | IDR_N_LP))
+        .map(|u| u.header.nal_unit_type)
+        .expect("fixture IDR");
+    let [expected, _] = decode_both(I_THEN_P_HEVC);
+    let expected = expected.expect("the unmodified fixture decodes");
+    assert_eq!(expected.len(), 2);
+    Fixture {
+        units,
+        idr,
+        expected,
+    }
+}
+
+impl Fixture {
+    /// The fixture's VPS, SPS, PPS and IDR, then `tail`.
+    fn after_idr(&self, tail: &[Vec<u8>]) -> Vec<u8> {
+        let mut stream = pick(&self.units, &[VPS, SPS, PPS, self.idr]);
+        stream.extend_from_slice(tail);
+        annexb(&stream)
+    }
+
+    fn unit(&self, t: u8) -> &NalUnit {
+        self.units
+            .iter()
+            .find(|u| u.header.nal_unit_type == t)
+            .expect("fixture NAL unit")
+    }
+}
+
+/// FFmpeg ps.c `remove_vps`: a VPS re-sent with other bytes (here one
+/// `general_profile_compatibility_flag`, RBSP bit 71) drops the SPS that
+/// refer to it. The same SPS bytes re-sent after it are then a new SPS
+/// whose activation clears the references, and a PPS whose SPS went with
+/// the VPS fails. The VPS's own bytes re-sent keep everything.
+#[test]
+fn a_changed_vps_drops_its_sps_and_their_references() {
+    let f = i_then_p();
+    let vps = f.unit(VPS);
+    let mut rbsp = vps.rbsp.clone();
+    rbsp[71 / 8] ^= 0x80 >> (71 % 8);
+    let changed_vps = coded(vps, &rbsp);
+    let [sps, pps, p] = [SPS, PPS, TRAIL_R].map(|t| {
+        let u = f.unit(t);
+        coded(u, &u.rbsp)
+    });
+
+    assert_reference_missing(
+        &f.after_idr(&[changed_vps.clone(), sps.clone(), pps.clone(), p.clone()]),
+        "a P picture after a changed VPS and its re-sent SPS",
+    );
+    for result in decode_both(&f.after_idr(&[changed_vps, pps.clone(), p.clone()])) {
+        let error = result.expect_err("a PPS whose SPS went with its VPS");
+        assert!(error.contains("sps id 0 was never activated"), "{error}");
+    }
+    let same_vps = coded(vps, &vps.rbsp);
+    for result in decode_both(&f.after_idr(&[same_vps, sps, pps, p])) {
+        assert_eq!(result.expect("a re-sent, unchanged VPS"), f.expected);
+    }
+}
+
+/// FFmpeg compares an SPS over its bit length without the stop bit and
+/// the zero bits after it, rounded up to bytes (h2645_parse.c
+/// `get_bit_length`, get_bits.h `get_bits_bytesize`, ps.c
+/// `compare_sps`). A resend that only adds a final standalone `0x80`
+/// byte, or trailing zero bytes, is the same SPS and keeps the references.
+#[test]
+fn an_sps_resend_differing_only_past_its_stop_bit_keeps_the_references() {
+    let f = i_then_p();
+    let sps = f.unit(SPS);
+    let mut body = sps.rbsp.clone();
+    while body.last() == Some(&0) {
+        body.pop();
+    }
+    let mut stop_byte = body.clone();
+    stop_byte.push(0x80);
+    let mut zero_bytes = coded(sps, &body);
+    zero_bytes.extend_from_slice(&[0x00, 0x00, 0x03]);
+    let [pps, p] = [PPS, TRAIL_R].map(|t| {
+        let u = f.unit(t);
+        coded(u, &u.rbsp)
+    });
+    for (what, resend) in [
+        ("a final 0x80 byte", coded(sps, &stop_byte)),
+        ("trailing zero bytes", zero_bytes),
+    ] {
+        for result in decode_both(&f.after_idr(&[resend.clone(), pps.clone(), p.clone()])) {
+            assert_eq!(result.expect(what), f.expected, "{what}");
+        }
+    }
+}

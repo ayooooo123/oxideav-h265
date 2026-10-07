@@ -268,7 +268,9 @@ impl Dpb {
     }
 
     /// Find a long-term candidate by exact POC or by LSB-only POC
-    /// (§8.3.2 step 1).
+    /// (§8.3.2 step 1) among the reference pictures: one already marked
+    /// "unused for reference" (by an IRAP, or cleared on an SPS change
+    /// with its eviction deferred) is no candidate.
     fn find_long_term(
         &self,
         target: i32,
@@ -278,6 +280,7 @@ impl Dpb {
     ) -> Option<usize> {
         self.entries.iter().position(|e| {
             e.layer_id == layer_id
+                && e.marking != Marking::Unused
                 && if msb_present {
                     e.poc == target
                 } else {
@@ -910,5 +913,27 @@ mod tests {
         let rps = dpb.apply_rps(false, 0, &lists, 256);
         assert_eq!(rps.lt_curr, vec![Some(0)]);
         assert_eq!(dpb.entries[0].marking, Marking::LongTerm);
+    }
+
+    /// §8.3.2 picks a long-term reference among the *reference* pictures:
+    /// a picture already marked unused (here by the SPS-change clear, its
+    /// eviction deferred to the end of a multi-layer access unit) stays
+    /// unused, and the entry resolves to "no reference picture", by full
+    /// POC and by POC LSBs.
+    #[test]
+    fn an_unused_picture_is_no_long_term_candidate() {
+        for msb_present in [true, false] {
+            let mut dpb = Dpb::new();
+            dpb.insert(entry(0, Marking::ShortTerm));
+            dpb.unmark_layer(0);
+            let lists = RpsPocLists {
+                lt_curr: vec![0],
+                curr_delta_poc_msb_present: vec![msb_present],
+                ..RpsPocLists::default()
+            };
+            let rps = dpb.apply_rps(false, 0, &lists, 256);
+            assert_eq!(rps.lt_curr, vec![None], "msb present: {msb_present}");
+            assert_eq!(dpb.entries[0].marking, Marking::Unused);
+        }
     }
 }

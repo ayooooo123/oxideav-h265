@@ -382,6 +382,25 @@ struct LayerState {
     active_sps: Option<u64>,
 }
 
+/// The bytes FFmpeg compares to recognise a re-sent VPS or SPS (the VPS
+/// check in `ff_hevc_decode_nal_vps`, ps.c `compare_sps`): the NAL header
+/// fields, then the RBSP up to its bit length without trailing zero
+/// bytes, the stop bit and the zero bits after it, rounded up to whole
+/// bytes (h2645_parse.c `get_bit_length`, get_bits.h
+/// `get_bits_bytesize`). A final standalone `0x80` byte is no part of it.
+fn parameter_set_source(header: &crate::nal::NalHeader, rbsp: &[u8]) -> Vec<u8> {
+    let size = rbsp
+        .iter()
+        .rposition(|&b| b != 0)
+        .map_or(0, |last| last + 1);
+    let span = rbsp[..size].last().map_or(0, |&last| {
+        (8 * size - (last.trailing_zeros() as usize + 1)).div_ceil(8)
+    });
+    let mut source = vec![header.nuh_layer_id, header.temporal_id];
+    source.extend_from_slice(&rbsp[..span]);
+    source
+}
+
 /// The access unit being assembled (F.7.4.2.4.4).
 #[derive(Debug, Default)]
 struct AccessUnit {
@@ -404,12 +423,14 @@ struct AccessUnit {
 #[derive(Debug, Default)]
 pub struct SequenceDecoder {
     vps: BTreeMap<u8, HevcVps>,
+    /// The [`parameter_set_source`] bytes each stored VPS was parsed from:
+    /// re-sending them changes nothing (FFmpeg `ff_hevc_decode_nal_vps`).
+    vps_source: BTreeMap<u8, Vec<u8>>,
     sps: BTreeMap<u8, SeqParameterSet>,
-    /// The NAL unit bytes each stored SPS was parsed from (header fields,
-    /// RBSP without trailing zero bytes) and the identity an activation
-    /// compares: re-sending those bytes keeps the stored SPS and its
-    /// identity (FFmpeg ps.c `compare_sps`); other bytes under the same id
-    /// replace it with a new identity.
+    /// The [`parameter_set_source`] bytes each stored SPS was parsed from
+    /// and the identity an activation compares: re-sending those bytes
+    /// keeps the stored SPS and its identity (FFmpeg ps.c `compare_sps`);
+    /// other bytes under the same id replace it with a new identity.
     sps_source: BTreeMap<u8, (Vec<u8>, u64)>,
     /// The last SPS identity handed out.
     sps_identities: u64,
@@ -679,8 +700,30 @@ impl SequenceDecoder {
                 if header.nuh_layer_id == 0 {
                     self.finish_picture()?;
                 }
+                // FFmpeg `ff_hevc_decode_nal_vps`: a repeat of the stored
+                // VPS's bytes changes nothing. Other bytes replace it and
+                // drop every SPS parsed against it (ps.c `remove_vps`), so
+                // an SPS re-sent after it is parsed again (a non-base
+                // layer's SPS may infer fields from the VPS) and gets a
+                // new identity.
+                let source = parameter_set_source(&header, &rbsp);
+                let vps_id = rbsp.first().map_or(0, |b| b >> 4);
+                if self.vps_source.get(&vps_id) == Some(&source) {
+                    return Ok(());
+                }
                 let vps = HevcVps::parse(&rbsp)
                     .map_err(|_| SequenceError::Malformed("video parameter set failed to parse"))?;
+                let dependent: Vec<u8> = self
+                    .sps
+                    .iter()
+                    .filter(|(_, sps)| sps.vps_id == vps.vps_id)
+                    .map(|(&id, _)| id)
+                    .collect();
+                for id in dependent {
+                    self.sps.remove(&id);
+                    self.sps_source.remove(&id);
+                }
+                self.vps_source.insert(vps.vps_id, source);
                 self.vps.insert(vps.vps_id, vps);
                 self.plan = None;
             }
@@ -699,12 +742,7 @@ impl SequenceDecoder {
                 // FFmpeg ps.c `compare_sps`: a repeat of the stored SPS's
                 // bytes keeps the stored SPS (and the identity activation
                 // compares); other bytes replace it under a new identity.
-                let payload = rbsp
-                    .iter()
-                    .rposition(|&b| b != 0)
-                    .map_or(0, |last| last + 1);
-                let mut source = vec![header.nuh_layer_id, header.temporal_id];
-                source.extend_from_slice(&rbsp[..payload]);
+                let source = parameter_set_source(&header, &rbsp);
                 if self
                     .sps_source
                     .get(&sps.sps_id)

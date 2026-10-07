@@ -1857,4 +1857,50 @@ mod tests {
         assert_eq!(ceil_log2(64), 6);
         assert_eq!(ceil_log2(65), 7);
     }
+
+    /// FFmpeg ps.c `remove_vps`: a VPS re-sent with other bytes drops the
+    /// SPS parsed against it, so the layer-1 SPS (whose multilayer form
+    /// takes its ordering limits from the VPS) is parsed again when it is
+    /// re-sent unchanged and reports the new reorder bound. Re-sending
+    /// the VPS's own bytes keeps the SPS.
+    #[test]
+    fn a_changed_vps_reparses_the_sps_inheriting_from_it() {
+        use crate::encoder::nal::{annexb, escape_rbsp};
+        use crate::sequence::SequenceDecoder;
+        // vps_max_num_reorder_pics[0] is ue(v) "011" (2) at RBSP bits
+        // 134..=136; flipping bit 136 makes it "010" (1) without moving
+        // the extension behind it.
+        let mut rbsp = strip_emulation_prevention(STEREO_VPS_NAL);
+        let reorder = |rbsp: &[u8]| {
+            HevcVps::parse(&rbsp[2..])
+                .expect("stereo VPS")
+                .sub_layer_ordering_info[0]
+                .max_num_reorder_pics
+        };
+        assert_eq!(reorder(&rbsp), 2);
+        rbsp[2 + 17] ^= 0x80; // RBSP bit 136: the top bit of byte 17
+        assert_eq!(reorder(&rbsp), 1);
+        let changed_vps = [&rbsp[..2], &escape_rbsp(&rbsp[2..])[..]].concat();
+        let push = |dec: &mut SequenceDecoder, units: &[&[u8]]| {
+            let units: Vec<Vec<u8>> = units.iter().map(|u| u.to_vec()).collect();
+            dec.push_annexb(&annexb(&units)).expect("parameter sets");
+        };
+        let mut dec = SequenceDecoder::new();
+        push(&mut dec, &[STEREO_VPS_NAL, STEREO_SPS1_NAL]);
+        assert_eq!(dec.max_num_reorder_pics(), Some(2));
+        push(&mut dec, &[&changed_vps]);
+        assert_eq!(
+            dec.max_num_reorder_pics(),
+            None,
+            "the replaced VPS's SPS is dropped"
+        );
+        push(&mut dec, &[STEREO_SPS1_NAL]);
+        assert_eq!(dec.max_num_reorder_pics(), Some(1));
+        push(&mut dec, &[&changed_vps]);
+        assert_eq!(
+            dec.max_num_reorder_pics(),
+            Some(1),
+            "a byte-identical VPS keeps its SPS"
+        );
+    }
 }
