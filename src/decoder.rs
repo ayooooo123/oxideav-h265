@@ -19,7 +19,8 @@ use std::collections::BinaryHeap;
 use std::collections::VecDeque;
 
 use oxideav_core::{
-    CodecId, CodecParameters, Decoder, Error, Frame, Packet, Result, VideoFrame, VideoPlane,
+    CodecId, CodecParameters, Decoder, Error, Frame, Packet, PixelFormat, Result, VideoFrame,
+    VideoPlane,
 };
 
 use crate::hvcc::{
@@ -39,8 +40,10 @@ pub struct H265Decoder {
     /// Decoded pictures not yet emitted, sorted on demand by
     /// `(cvs_index, poc)`.
     reorder: Vec<DecodedFrame>,
-    /// Frames ready to hand out.
-    ready: VecDeque<Frame>,
+    /// Frames ready to hand out, each with its [`Layout`].
+    ready: VecDeque<(Frame, Layout)>,
+    /// The [`Layout`] of the frame `receive_frame` last returned.
+    last_output: Option<Layout>,
     /// Min-heap of packet PTS values, re-attached in output order.
     pts_queue: BinaryHeap<std::cmp::Reverse<i64>>,
     /// `Some(n)` when the extradata was an `hvcC` record: packets are
@@ -151,6 +154,7 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         seq,
         reorder: Vec::new(),
         ready: VecDeque::new(),
+        last_output: None,
         pts_queue: BinaryHeap::new(),
         nal_length_size,
         flushed: false,
@@ -192,6 +196,7 @@ impl H265Decoder {
                 continue;
             }
             let pts = self.pts_queue.pop().map(|r| r.0);
+            let layout = frame_layout(&f.picture, &f.crop);
             // §7.4.3.2.1 — output the conformance-cropped picture,
             // packed straight from the decoded planes.
             let frame = video_frame_owned(f.picture, &f.crop, pts, |plane| {
@@ -199,8 +204,22 @@ impl H265Decoder {
                     self.seq.recycle_plane(plane);
                 }
             });
-            self.ready.push_back(Frame::Video(frame));
+            self.ready.push_back((Frame::Video(frame), layout));
         }
+    }
+
+    /// The [`Layout`] `output_*` report: the frame last returned, or before
+    /// the first one the next frame in output order (never parameter sets
+    /// no decoded picture uses yet).
+    fn reported_layout(&self) -> Option<Layout> {
+        self.last_output.or_else(|| {
+            self.ready.front().map(|(_, layout)| *layout).or_else(|| {
+                self.reorder
+                    .iter()
+                    .find(|f| f.output)
+                    .map(|f| frame_layout(&f.picture, &f.crop))
+            })
+        })
     }
 }
 
@@ -235,19 +254,29 @@ impl Decoder for H265Decoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        if let Some(f) = self.ready.pop_front() {
+        if let Some((f, layout)) = self.ready.pop_front() {
+            self.last_output = Some(layout);
             return Ok(f);
         }
         if self.flushed {
             if !self.reorder.is_empty() {
                 self.drain(true);
-                if let Some(f) = self.ready.pop_front() {
+                if let Some((f, layout)) = self.ready.pop_front() {
+                    self.last_output = Some(layout);
                     return Ok(f);
                 }
             }
             return Err(Error::Eof);
         }
         Err(Error::NeedMore)
+    }
+
+    fn output_video_dimensions(&self) -> Option<(u32, u32)> {
+        self.reported_layout().and_then(|(dims, _)| dims)
+    }
+
+    fn output_pixel_format(&self) -> Option<PixelFormat> {
+        self.reported_layout().and_then(|(_, format)| format)
     }
 
     fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
@@ -270,6 +299,60 @@ impl Decoder for H265Decoder {
     }
 }
 
+/// The visible size and pixel layout of an output frame: `None` dimensions
+/// for an empty cropped window, `None` layout where no [`PixelFormat`]
+/// describes the packed planes.
+type Layout = (Option<(u32, u32)>, Option<PixelFormat>);
+
+/// The §7.4.3.2.1 conformance window `(x0, y0, width, height)` of `pic`,
+/// clamped to the coded picture as [`Picture::cropped`] does.
+fn visible_window(pic: &Picture, crop: &CropWindow) -> (usize, usize, usize, usize) {
+    let (lw, lh) = pic.plane_dims(Plane::Luma);
+    let (x0, y0) = (crop.x0.min(lw), crop.y0.min(lh));
+    (x0, y0, crop.width.min(lw - x0), crop.height.min(lh - y0))
+}
+
+/// The [`Layout`] of the frame [`video_frame_owned`] packs from `pic`.
+fn frame_layout(pic: &Picture, crop: &CropWindow) -> Layout {
+    let (_, _, w, h) = visible_window(pic, crop);
+    let dims = (w > 0 && h > 0)
+        .then(|| Some((u32::try_from(w).ok()?, u32::try_from(h).ok()?)))
+        .flatten();
+    (dims, pixel_format(pic))
+}
+
+/// The [`PixelFormat`] of [`video_frame_owned`]'s planes: one byte per
+/// 8-bit sample, else little-endian 16-bit words. `None` for depths no
+/// format names (9, 11, 13–15 bits) and for luma and chroma of different
+/// depths.
+fn pixel_format(pic: &Picture) -> Option<PixelFormat> {
+    use PixelFormat::*;
+    let cat = pic.chroma_array_type();
+    let depth = pic.bit_depth(Plane::Luma);
+    if cat != 0 && pic.bit_depth(Plane::Cb) != depth {
+        return None;
+    }
+    Some(match (cat, depth) {
+        (0, 8) => Gray8,
+        (0, 10) => Gray10Le,
+        (0, 12) => Gray12Le,
+        (0, 16) => Gray16Le,
+        (1, 8) => Yuv420P,
+        (1, 10) => Yuv420P10Le,
+        (1, 12) => Yuv420P12Le,
+        (1, 16) => Yuv420P16Le,
+        (2, 8) => Yuv422P,
+        (2, 10) => Yuv422P10Le,
+        (2, 12) => Yuv422P12Le,
+        (2, 16) => Yuv422P16Le,
+        (3, 8) => Yuv444P,
+        (3, 10) => Yuv444P10Le,
+        (3, 12) => Yuv444P12Le,
+        (3, 16) => Yuv444P16Le,
+        _ => return None,
+    })
+}
+
 /// Pack the §7.4.3.2.1 conformance-cropped window of a reconstructed
 /// [`Picture`] into a [`VideoFrame`] (8-bit planes as one byte per
 /// sample; higher bit depths as little-endian 16-bit, the planar
@@ -285,9 +368,8 @@ fn video_frame_owned(
 ) -> VideoFrame {
     let chroma = pic.chroma_array_type() != 0;
     let wide = pic.bit_depth(Plane::Luma) > 8 || (chroma && pic.bit_depth(Plane::Cb) > 8);
-    let (lw, lh) = pic.plane_dims(Plane::Luma);
-    let (x0, y0) = (crop.x0.min(lw), crop.y0.min(lh));
-    let (w, h) = (crop.width.min(lw - x0), crop.height.min(lh - y0));
+    let (lw, _) = pic.plane_dims(Plane::Luma);
+    let (x0, y0, w, h) = visible_window(&pic, crop);
     // (x, y, width, height, plane stride) per packed plane.
     let mut windows = vec![(x0, y0, w, h, lw)];
     if chroma {

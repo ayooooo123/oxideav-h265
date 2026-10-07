@@ -54,6 +54,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   VCL mutation corpus, and must agree on every frame and reported error.
   The module's unit tests compare randomized interpolation blocks, SAO
   pictures, prediction units and luma deblocking segments.
+- The registry decoder reports `Decoder::output_video_dimensions` and
+  `output_pixel_format` (oxideav-core 96094a9): the conformance-cropped
+  size and planar layout of the frame `receive_frame` last returned
+  (before the first frame, of the next frame in output order). Gray,
+  4:2:0, 4:2:2 and 4:4:4 at 8, 10, 12 and 16 bits map to their
+  `PixelFormat`s; other depths, and luma and chroma of different depths,
+  report no format. A player can now size its output for raw `.hevc`
+  streams, whose container declares no size. `tests/decoded_format.rs`
+  checks odd cropped sizes, 10- and 12-bit layouts and mid-stream changes.
 - Strict original-FATE coverage (`tests/fate_conformance.rs`, `FATE_SUITE`):
   52 complete Main/Main10/RExt streams against FFmpeg, serial and two-thread.
   The availability change preserves all four pre-existing mismatches:
