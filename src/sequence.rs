@@ -419,6 +419,86 @@ pub struct SequenceDecoder {
     /// Worker budget for the per-picture wavefront / row-parallel
     /// filters (0 or 1 = serial).
     threads: usize,
+    /// Buffers of pictures nothing references any more, for the next
+    /// pictures.
+    spare: SpareBuffers,
+}
+
+/// The sample planes and motion fields of pictures that left the DPB
+/// (or were output after leaving it), reused by later pictures instead
+/// of fresh allocations whose pages fault in on first write. Bounded to
+/// two pictures' worth.
+#[derive(Debug, Default)]
+struct SpareBuffers {
+    planes: Vec<Vec<u16>>,
+    fields: Vec<crate::motion::MotionField>,
+}
+
+impl SpareBuffers {
+    const MAX_PLANES: usize = 6;
+    const MAX_FIELDS: usize = 2;
+
+    /// Keep a plane buffer that no picture shares any more.
+    fn keep_plane(&mut self, plane: std::sync::Arc<Vec<u16>>) {
+        if let Ok(buf) = std::sync::Arc::try_unwrap(plane) {
+            if buf.capacity() > 0 && self.planes.len() < Self::MAX_PLANES {
+                self.planes.push(buf);
+            }
+        }
+    }
+
+    /// Keep the planes and motion field of a picture evicted from the
+    /// DPB (planes still shared with an unoutput frame stay with it).
+    fn keep_entry(&mut self, entry: crate::dpb::DpbEntry) {
+        for plane in entry.picture.into_shared_planes() {
+            self.keep_plane(plane);
+        }
+        if self.fields.len() < Self::MAX_FIELDS {
+            self.fields.push(entry.motion);
+        }
+    }
+
+    /// `len` zero samples, in the smallest spare buffer that fits when
+    /// there is one.
+    fn zeroed(&mut self, len: usize) -> Vec<u16> {
+        let fit = self
+            .planes
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.capacity() >= len)
+            .min_by_key(|(_, b)| b.capacity())
+            .map(|(i, _)| i);
+        match fit {
+            Some(i) if len > 0 => {
+                let mut buf = self.planes.swap_remove(i);
+                buf.clear();
+                buf.resize(len, 0);
+                buf
+            }
+            _ => vec![0u16; len],
+        }
+    }
+
+    /// A whole zeroed picture, as [`Picture::new`].
+    fn picture(&mut self, geom: &Geometry, params: &crate::recon::ReconParams) -> Picture {
+        Picture::with_planes(
+            geom.width as usize,
+            geom.height as usize,
+            params.chroma_array_type,
+            params.bit_depth_luma,
+            params.bit_depth_chroma,
+            |len| self.zeroed(len),
+        )
+    }
+
+    /// An all-intra motion field, as [`crate::motion::MotionField::new`].
+    fn motion_field(&mut self, geom: &Geometry) -> crate::motion::MotionField {
+        let (w, h) = (geom.width as usize, geom.height as usize);
+        match self.fields.pop() {
+            Some(field) => field.recycled(w, h),
+            None => crate::motion::MotionField::new(w, h),
+        }
+    }
 }
 
 impl SequenceDecoder {
@@ -638,6 +718,13 @@ impl SequenceDecoder {
     pub fn release_references(&mut self) {
         self.state.dpb_mut().clear();
         self.au.pictures.clear();
+        self.spare = SpareBuffers::default();
+    }
+
+    /// Keep an output plane for later pictures once nothing else shares
+    /// it (a shared one is simply released).
+    pub(crate) fn recycle_plane(&mut self, plane: std::sync::Arc<Vec<u16>>) {
+        self.spare.keep_plane(plane);
     }
 
     /// Drain the pictures decoded so far, in decode order. The caller
@@ -726,7 +813,9 @@ impl SequenceDecoder {
         // multi-layer stream: the same-AU inter-layer references are
         // held by DPB index.
         if !plan.multi_layer || self.au.pictures.is_empty() {
-            self.state.dpb_mut().evict_unused();
+            for entry in self.state.dpb_mut().evict_unused() {
+                self.spare.keep_entry(entry);
+            }
         }
 
         // §7.4.2.4.4 CVS bookkeeping: an IRAP with NoRaslOutputFlag
@@ -1103,6 +1192,10 @@ impl SequenceDecoder {
             );
             (pic, merged.field)
         } else {
+            let buffers = (
+                self.spare.picture(&geom, &recon_params),
+                self.spare.motion_field(&geom),
+            );
             self.decode_picture_serial(
                 segs,
                 indep,
@@ -1115,6 +1208,7 @@ impl SequenceDecoder {
                 col_field,
                 &across_of_slice,
                 workers,
+                buffers,
             )?
         };
 
@@ -1180,10 +1274,10 @@ impl SequenceDecoder {
         col_field: Option<&crate::motion::MotionField>,
         across_of_slice: &BTreeMap<u32, bool>,
         workers: usize,
+        buffers: (Picture, crate::motion::MotionField),
     ) -> Result<(Picture, crate::motion::MotionField), SequenceError> {
-        let mut reconstructor = PictureReconstructor::new(
-            geom.width as usize,
-            geom.height as usize,
+        let mut reconstructor = PictureReconstructor::with_buffers(
+            buffers,
             recon_params,
             slice_ctx,
             &geom.tiles,

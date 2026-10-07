@@ -50,6 +50,8 @@
 //! construction are the consumers' / follow-ups' responsibility — this
 //! module stops at the `(nTbS)x(nTbS)` array `r`.
 
+use std::cell::RefCell;
+
 use crate::scaling_list::ScalingFactorMatrix;
 
 /// §8.6.3 `levelScale[ k ]` rational quantization-step list, indexed by
@@ -201,69 +203,160 @@ pub fn scale_coefficients(
     extended_precision: bool,
     scaling: Option<&ScalingFactorMatrix>,
 ) -> Result<Vec<i32>, TransformError> {
-    let log2_tbs = log2_tbs(n_tbs).ok_or(TransformError::InvalidBlockSize(n_tbs))?;
-    if !(8..=16).contains(&bit_depth) {
-        return Err(TransformError::InvalidBitDepth(bit_depth));
-    }
-    let count = n_tbs * n_tbs;
-    if levels.len() != count {
-        return Err(TransformError::LengthMismatch {
-            expected: count,
-            got: levels.len(),
-        });
-    }
-    if let Some(m) = scaling {
-        let m_count = m.dim as usize * m.dim as usize;
-        if m_count != count {
-            return Err(TransformError::LengthMismatch {
-                expected: count,
-                got: m_count,
-            });
-        }
-    }
-
-    // §8.6.3 equations 8-300/8-304 (log2TransformRange),
-    // 8-301/8-305 (bdShift), 8-302..8-307 (coeffMin/coeffMax).
-    let log2_transform_range = if extended_precision {
-        core::cmp::max(15, bit_depth as i32 + 6)
-    } else {
-        15
-    };
-    let bd_shift = bit_depth as i32 + log2_tbs as i32 + 10 - log2_transform_range;
-    let (coeff_min, coeff_max) = coeff_range(bit_depth, extended_precision);
-
-    let level_scale = LEVEL_SCALE[(q_p % 6) as usize] as i64;
-    let qp_div6 = q_p / 6;
-    // bdShift is always >= 1 for the dimensioned ranges (bitDepth >= 8,
-    // log2TrafoSize >= 2, log2TransformRange <= bitDepth + 6), so the
-    // (1 << (bdShift - 1)) rounding offset is well-formed.
-    let round = 1i64 << (bd_shift - 1);
-
-    let mut d = vec![0i32; count];
-    for y in 0..n_tbs {
-        for x in 0..n_tbs {
-            let idx = y * n_tbs + x;
-            // A zero level scales to ( round >> bdShift ) == 0 (the
-            // offset is 1 << ( bdShift − 1 )), so only coded positions
-            // need the product.
-            let level = levels[idx];
-            if level == 0 {
-                continue;
-            }
-            // §8.6.3 m[ x ][ y ]: flat 16 unless an explicit
-            // ScalingFactor matrix is supplied (the caller folds the
-            // "transform_skip && nTbS > 4 ⇒ 16" exception into the
-            // `scaling` argument it passes).
-            let m = scaling.map_or(16i64, |sf| sf.at(x, y) as i64);
-            // §8.6.3 eq. 8-309: clip( (TransCoeffLevel * m * levelScale
-            // << (qP/6)) + round ) >> bdShift.
-            let prod = (level as i64) * m * level_scale;
-            let shifted = (prod << qp_div6) + round;
-            let scaled = clip3(coeff_min as i64, coeff_max as i64, shifted >> bd_shift);
-            d[idx] = scaled as i32;
-        }
+    let scaler = Scaler::new(levels, n_tbs, q_p, bit_depth, extended_precision, scaling)?;
+    let mut d = vec![0i32; n_tbs * n_tbs];
+    for (idx, (&level, out)) in levels.iter().zip(&mut d).enumerate() {
+        *out = scaler.scale(level, idx % n_tbs, idx / n_tbs);
     }
     Ok(d)
+}
+
+/// The §8.6.3 scaling of one transform block's levels (equation 8-309),
+/// with its inputs validated.
+struct Scaler<'a> {
+    level_scale: i64,
+    qp_div6: u32,
+    round: i64,
+    bd_shift: i32,
+    coeff_min: i64,
+    coeff_max: i64,
+    scaling: Option<&'a ScalingFactorMatrix>,
+    /// `16 · levelScale` when the block scales in `i32` lanes: flat `m`,
+    /// no extended precision and `qP / 6 <= bdShift + 3` (every
+    /// conformant `qP`: `qP / 6 <= BitDepth` while `bdShift = BitDepth +
+    /// log2( nTbS ) − 5`). For `|level| <= 2^15` each product
+    /// `level · 16 · levelScale` then stays below 2^26 and each shifted
+    /// value below 2^30.
+    flat_i32: Option<i32>,
+}
+
+impl<'a> Scaler<'a> {
+    /// Validates the [`scale_coefficients`] inputs and derives the
+    /// block's scaling constants.
+    fn new(
+        levels: &[i32],
+        n_tbs: usize,
+        q_p: u32,
+        bit_depth: u8,
+        extended_precision: bool,
+        scaling: Option<&'a ScalingFactorMatrix>,
+    ) -> Result<Self, TransformError> {
+        let log2_tbs = log2_tbs(n_tbs).ok_or(TransformError::InvalidBlockSize(n_tbs))?;
+        if !(8..=16).contains(&bit_depth) {
+            return Err(TransformError::InvalidBitDepth(bit_depth));
+        }
+        let count = n_tbs * n_tbs;
+        if levels.len() != count {
+            return Err(TransformError::LengthMismatch {
+                expected: count,
+                got: levels.len(),
+            });
+        }
+        if let Some(m) = scaling {
+            let m_count = m.dim as usize * m.dim as usize;
+            if m_count != count {
+                return Err(TransformError::LengthMismatch {
+                    expected: count,
+                    got: m_count,
+                });
+            }
+        }
+
+        // §8.6.3 equations 8-300/8-304 (log2TransformRange),
+        // 8-301/8-305 (bdShift), 8-302..8-307 (coeffMin/coeffMax).
+        let log2_transform_range = if extended_precision {
+            core::cmp::max(15, bit_depth as i32 + 6)
+        } else {
+            15
+        };
+        let bd_shift = bit_depth as i32 + log2_tbs as i32 + 10 - log2_transform_range;
+        let (coeff_min, coeff_max) = coeff_range(bit_depth, extended_precision);
+        let qp_div6 = q_p / 6;
+        let level_scale = LEVEL_SCALE[(q_p % 6) as usize];
+        let flat_i32 = (scaling.is_none()
+            && !extended_precision
+            && i64::from(qp_div6) <= i64::from(bd_shift) + 3)
+            .then(|| 16 * level_scale);
+        Ok(Self {
+            level_scale: i64::from(level_scale),
+            qp_div6,
+            // bdShift is always >= 1 for the dimensioned ranges (bitDepth
+            // >= 8, log2TrafoSize >= 2, log2TransformRange <= bitDepth +
+            // 6), so the (1 << (bdShift - 1)) rounding offset is
+            // well-formed.
+            round: 1i64 << (bd_shift - 1),
+            bd_shift,
+            coeff_min: i64::from(coeff_min),
+            coeff_max: i64::from(coeff_max),
+            scaling,
+            flat_i32,
+        })
+    }
+
+    /// The scaled `levels` (`n` per row) over their `cols × rows` extent,
+    /// written row-major, `cols` per row, into `d`.
+    fn scale_extent(
+        &self,
+        levels: &[i32],
+        n: usize,
+        (cols, rows): (usize, usize),
+        d: &mut Vec<i32>,
+    ) {
+        let extent = || levels.chunks_exact(n).take(rows).map(|row| &row[..cols]);
+        d.clear();
+        if let Some(f) = self.flat_i32 {
+            // Equation 8-309 regrouped for a = level · 16 · levelScale:
+            // ( ( a << s ) + 2^(b−1) ) >> b is ( a + 2^(b−1−s) ) >> ( b − s )
+            // for s < b, and a << ( s − b ) otherwise (the added half
+            // never reaches the next integer).
+            let (s, b) = (self.qp_div6 as i32, self.bd_shift);
+            let (up, down, round) = if s < b {
+                (0, b - s, 1 << (b - 1 - s))
+            } else {
+                (s - b, 0, 0)
+            };
+            let (lo, hi) = (self.coeff_min as i32, self.coeff_max as i32);
+            let mut wide = false;
+            for row in extent() {
+                d.extend(row.iter().map(|&level| {
+                    wide |= level.unsigned_abs() > 1 << 15;
+                    ((level.wrapping_mul(f) << up).wrapping_add(round) >> down).clamp(lo, hi)
+                }));
+            }
+            if !wide {
+                return;
+            }
+            // A level outside the conformant range: the exact form.
+            d.clear();
+        }
+        for (y, row) in extent().enumerate() {
+            d.extend(
+                row.iter()
+                    .enumerate()
+                    .map(|(x, &level)| self.scale(level, x, y)),
+            );
+        }
+    }
+
+    /// `d[ x ][ y ]` for `TransCoeffLevel[ x ][ y ] == level`.
+    #[inline]
+    fn scale(&self, level: i32, x: usize, y: usize) -> i32 {
+        // A zero level scales to ( round >> bdShift ) == 0 (the offset is
+        // 1 << ( bdShift − 1 )), so only coded positions need the
+        // product.
+        if level == 0 {
+            return 0;
+        }
+        // §8.6.3 m[ x ][ y ]: flat 16 unless an explicit ScalingFactor
+        // matrix is supplied (the caller folds the "transform_skip &&
+        // nTbS > 4 ⇒ 16" exception into the `scaling` argument it passes).
+        let m = self.scaling.map_or(16i64, |sf| sf.at(x, y) as i64);
+        // §8.6.3 eq. 8-309: clip( (TransCoeffLevel * m * levelScale
+        // << (qP/6)) + round ) >> bdShift.
+        let prod = (level as i64) * m * self.level_scale;
+        let shifted = (prod << self.qp_div6) + self.round;
+        clip3(self.coeff_min, self.coeff_max, shifted >> self.bd_shift) as i32
+    }
 }
 
 /// §8.6.4.2 equation 8-316 — the `trType == 1` 4x4 alternate (DST-VII)
@@ -456,40 +549,94 @@ pub fn inverse_transform(
     // §8.6.4 trType: 1 iff MODE_INTRA, nTbS == 4, cIdx == 0.
     let tr_type =
         matches!(pred_mode, PredMode::Intra) && n_tbs == 4 && matches!(component, Component::Luma);
-    // §8.6.4 eqs. 8-310..8-313: the intermediate-clip coeffMin/coeffMax.
-    let (coeff_min, coeff_max) = coeff_range(bit_depth, extended_precision);
-
-    // The coded coefficients are sparse: the §7.3.8.11 scan never
-    // places a level past the last significant position, so the rows
-    // below the last non-zero row and the columns right of the last
-    // non-zero column are all zero. Zero inputs contribute nothing to
-    // either matrix product, so the passes run over the non-zero extent
-    // only (an all-zero block synthesizes to all zeros).
-    let mut max_x = 0usize;
-    let mut max_y = 0usize;
-    let mut any = false;
-    for y in 0..n_tbs {
-        let row = &d[y * n_tbs..(y + 1) * n_tbs];
-        if let Some(last) = row.iter().rposition(|&v| v != 0) {
-            any = true;
-            max_x = max_x.max(last);
-            max_y = y;
-        }
-    }
-    let mut r = vec![0i32; count];
-    if !any {
-        return Ok(r);
-    }
-    if extended_precision {
-        inverse_transform_passes::<i64>(
-            d, n_tbs, tr_type, coeff_min, coeff_max, max_x, max_y, &mut r,
-        );
-    } else {
-        inverse_transform_passes::<i32>(
-            d, n_tbs, tr_type, coeff_min, coeff_max, max_x, max_y, &mut r,
+    let mut r = vec![0i32; n_tbs * n_tbs];
+    // The coded coefficients are sparse: the §7.3.8.11 scan never places
+    // a level past the last significant position, so the rows below the
+    // last non-zero row and the columns right of the last non-zero
+    // column are all zero. Zero inputs contribute nothing to either
+    // matrix product, so the passes run over the non-zero extent only (an
+    // all-zero block synthesizes to all zeros).
+    if let Some(extent) = nonzero_extent(d, n_tbs) {
+        inverse_transform_passes(
+            (d, n_tbs),
+            n_tbs,
+            tr_type,
+            (bit_depth, extended_precision),
+            extent,
+            0,
+            &mut r,
         );
     }
     Ok(r)
+}
+
+/// One past the last non-zero column and row of the row-major `n × n`
+/// `block` (`n` a validated transform size), `None` when it is all zero.
+fn nonzero_extent(block: &[i32], n: usize) -> Option<(usize, usize)> {
+    match n {
+        4 => extent_of::<4>(block),
+        8 => extent_of::<8>(block),
+        16 => extent_of::<16>(block),
+        32 => extent_of::<32>(block),
+        _ => unreachable!("transform size {n} validated by the caller"),
+    }
+}
+
+/// [`nonzero_extent`] for `N × N`: every row ORed into one column mask,
+/// without early exits, so each row is a few whole-vector operations.
+fn extent_of<const N: usize>(block: &[i32]) -> Option<(usize, usize)> {
+    let mut columns = [0i32; N];
+    let mut rows = 0;
+    for (y, row) in block.chunks_exact(N).enumerate() {
+        let mut any = 0;
+        for (c, &v) in columns.iter_mut().zip(row) {
+            *c |= v;
+            any |= v;
+        }
+        if any != 0 {
+            rows = y + 1;
+        }
+    }
+    let cols = columns.iter().rposition(|&c| c != 0)? + 1;
+    Some((cols, rows))
+}
+
+thread_local! {
+    /// The scaled coefficients of [`scaled_inverse_transform`]'s extent.
+    static SCALED: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// §8.6.3 scaling then §8.6.4 transformation of one block's levels, with
+/// the equation 8-299 `bdShift` round folded into the row pass. Only the
+/// non-zero extent of `levels` is scaled: a zero level scales to zero,
+/// and the transform skips the zero columns / rows beyond it.
+fn scaled_inverse_transform(
+    levels: &[i32],
+    n_tbs: usize,
+    scaler: &Scaler<'_>,
+    tr_type: bool,
+    precision: (u8, bool),
+    bd_shift: i32,
+) -> Vec<i32> {
+    let mut r = vec![0i32; n_tbs * n_tbs];
+    let Some((cols, rows)) = nonzero_extent(levels, n_tbs) else {
+        return r;
+    };
+    SCALED.with(|cell| {
+        with_cell_buffer(cell, |d| {
+            scaler.scale_extent(levels, n_tbs, (cols, rows), d);
+            inverse_transform_passes(
+                (d, cols),
+                n_tbs,
+                tr_type,
+                precision,
+                (cols, rows),
+                bd_shift,
+                &mut r,
+            );
+        });
+    });
+    r
 }
 
 /// The arithmetic type of the two §8.6.4 passes: `i32` holds every
@@ -504,147 +651,288 @@ trait TransformAcc:
     + core::ops::Mul<Output = Self>
     + From<i32>
 {
-    fn to_i64(self) -> i64;
-    fn from_i64(v: i64) -> Self;
+    /// Equation 8-314: `Clip3( lo, hi, ( self + 64 ) >> 7 )`.
+    fn clip_intermediate(self, lo: i32, hi: i32) -> Self;
+    /// The row output narrowed to `i32` and offset-rounded by `bd_shift`
+    /// (equation 8-299; `bd_shift == 0` leaves it unrounded).
+    fn round_shift(self, bd_shift: i32) -> i32;
+    /// Runs `f` with this thread's reusable intermediate buffer (fresh
+    /// when it is already in use further up the stack).
+    fn with_buffer<R>(f: impl FnOnce(&mut Vec<Self>) -> R) -> R;
+}
+
+thread_local! {
+    static BUFFER_I32: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
+    static BUFFER_I64: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` with the buffer in `cell`, or a fresh one when it is borrowed.
+fn with_cell_buffer<T, R>(cell: &RefCell<Vec<T>>, f: impl FnOnce(&mut Vec<T>) -> R) -> R {
+    match cell.try_borrow_mut() {
+        Ok(mut buf) => f(&mut buf),
+        Err(_) => f(&mut Vec::new()),
+    }
 }
 
 impl TransformAcc for i32 {
+    // Without extended precision every column / row sum is at most
+    // 32 · 90 · 2^15 < 2^27 in magnitude, so the round offsets
+    // (≤ 2^11) cannot overflow `i32`.
     #[inline]
-    fn to_i64(self) -> i64 {
-        i64::from(self)
+    fn clip_intermediate(self, lo: i32, hi: i32) -> Self {
+        ((self + 64) >> 7).clamp(lo, hi)
     }
     #[inline]
-    fn from_i64(v: i64) -> Self {
-        v as i32
+    fn round_shift(self, bd_shift: i32) -> i32 {
+        if bd_shift > 0 {
+            (self + (1 << (bd_shift - 1))) >> bd_shift
+        } else {
+            self
+        }
+    }
+    fn with_buffer<R>(f: impl FnOnce(&mut Vec<Self>) -> R) -> R {
+        BUFFER_I32.with(|cell| with_cell_buffer(cell, f))
     }
 }
 
 impl TransformAcc for i64 {
     #[inline]
-    fn to_i64(self) -> i64 {
-        self
+    fn clip_intermediate(self, lo: i32, hi: i32) -> Self {
+        clip3(i64::from(lo), i64::from(hi), (self + 64) >> 7)
     }
     #[inline]
-    fn from_i64(v: i64) -> Self {
-        v
+    fn round_shift(self, bd_shift: i32) -> i32 {
+        let pre = self as i32;
+        if bd_shift > 0 {
+            ((i64::from(pre) + (1i64 << (bd_shift - 1))) >> bd_shift) as i32
+        } else {
+            pre
+        }
+    }
+    fn with_buffer<R>(f: impl FnOnce(&mut Vec<Self>) -> R) -> R {
+        BUFFER_I64.with(|cell| with_cell_buffer(cell, f))
     }
 }
 
-/// §8.6.4 steps 1 .. 3 over the non-zero extent `[0, max_x] × [0,
-/// max_y]` of `d`: the column pass (eq. 8-313), the eq. 8-314
-/// intermediate clip and the row pass, writing the pre-`bdShift`
-/// residual into `r`.
-#[allow(clippy::too_many_arguments)]
-fn inverse_transform_passes<T: TransformAcc>(
-    d: &[i32],
+/// §8.6.4 steps 1 .. 3 over the non-zero extent `(cols, rows)` of the
+/// scaled coefficients `d` (row stride `d_stride`): the column pass
+/// (eq. 8-313), the eq. 8-314 intermediate clip and the row pass,
+/// writing every residual of the `n_tbs × n_tbs` block `r`, each rounded
+/// by the equation 8-299 `bd_shift` (`0`: left unrounded). `precision`
+/// is `(bitDepth, extended_precision_processing_flag)`.
+fn inverse_transform_passes(
+    (d, d_stride): (&[i32], usize),
     n_tbs: usize,
     tr_type: bool,
-    coeff_min: i32,
-    coeff_max: i32,
-    max_x: usize,
-    max_y: usize,
+    (bit_depth, extended_precision): (u8, bool),
+    extent: (usize, usize),
+    bd_shift: i32,
     r: &mut [i32],
 ) {
-    let count = n_tbs * n_tbs;
-    // §8.6.4 step 1: column transform d[x][y] over y -> e[x][y], then
-    // step 2 (eq. 8-314): g[x][y] = clip( (e + 64) >> 7 ). Columns past
-    // the last non-zero one stay zero.
-    let mut g = vec![T::default(); count];
-    let mut col = [T::default(); 32];
-    let mut out = [T::default(); 32];
-    let (lo, hi) = (i64::from(coeff_min), i64::from(coeff_max));
-    for x in 0..=max_x {
-        for (y, c) in col.iter_mut().enumerate().take(n_tbs) {
-            *c = T::from(d[y * n_tbs + x]);
-        }
-        synthesize_1d(&col[..n_tbs], max_y + 1, tr_type, &mut out[..n_tbs]);
-        for (y, &v) in out.iter().enumerate().take(n_tbs) {
-            g[y * n_tbs + x] = T::from_i64(clip3(lo, hi, (v.to_i64() + 64) >> 7));
-        }
-    }
-    // §8.6.4 step 3: row transform g[x][y] over x -> r[x][y]. The row
-    // output is not clipped here; equation 8-299's bdShift round (in
-    // residual_block) narrows it.
-    for y in 0..n_tbs {
-        let row = &g[y * n_tbs..(y + 1) * n_tbs];
-        synthesize_1d(row, max_x + 1, tr_type, &mut out[..n_tbs]);
-        for (x, &v) in out.iter().enumerate().take(n_tbs) {
-            r[y * n_tbs + x] = v.to_i64() as i32;
-        }
+    // §8.6.4 eqs. 8-310..8-313: the intermediate-clip coeffMin/coeffMax.
+    let coeff = coeff_range(bit_depth, extended_precision);
+    let source = (d, d_stride);
+    if extended_precision {
+        transform_passes::<i64>(source, n_tbs, tr_type, coeff, extent, bd_shift, r);
+    } else {
+        transform_passes::<i32>(source, n_tbs, tr_type, coeff, extent, bd_shift, r);
     }
 }
 
-/// §8.6.4.2 for one row / column: `y[ i ] = Σ_j transMatrix[ i ][ j ·
-/// stride ] · x[ j ]` over the first `nz` inputs (the rest are zero).
-/// The DCT-II case is evaluated as the even / odd regrouping of that
-/// sum — the §8.6.4.2 basis has `transMatrix[ n − 1 − i ][ j ] =
-/// (−1)^j · transMatrix[ i ][ j ]` for the `n`-point subsampling, so
-/// every output pair `(i, n − 1 − i)` shares the even-`j` partial sum
-/// and differs by the sign of the odd-`j` one, and the even-`j` sum is
-/// itself the `n / 2`-point synthesis of the even coefficients. The
-/// regrouping only re-associates integer additions (no intermediate
-/// rounding), so the result is the matrix product bit for bit.
-#[inline]
-fn synthesize_1d<T: TransformAcc>(x: &[T], nz: usize, tr_type: bool, y: &mut [T]) {
-    let n = x.len();
-    let nz = nz.min(n);
-    if tr_type {
-        // eq. 8-316 DST-VII (4-point only; see `transform_1d`).
-        for (i, yi) in y.iter_mut().enumerate().take(4) {
-            let mut acc = T::default();
-            for (j, &xj) in x.iter().enumerate().take(nz) {
-                acc = acc + T::from(DST4[j][i]) * xj;
+/// [`inverse_transform_passes`] with the accumulator type fixed.
+fn transform_passes<T: TransformAcc>(
+    (d, d_stride): (&[i32], usize),
+    n_tbs: usize,
+    tr_type: bool,
+    (coeff_min, coeff_max): (i32, i32),
+    (cols, rows): (usize, usize),
+    bd_shift: i32,
+    r: &mut [i32],
+) {
+    let clip = |v: T| v.clip_intermediate(coeff_min, coeff_max);
+    // §8.6.4 step 3 leaves the row output unclipped; equation 8-299
+    // narrows it by bdShift.
+    let finish = |v: T| v.round_shift(bd_shift);
+    // §8.6.4 steps 1 and 2: g[x][y] = clip( (e + 64) >> 7 ) of the
+    // column transform e, kept for the non-zero columns only as an
+    // `n_tbs × cols` array (every element written by the column pass);
+    // later columns are zero and add nothing to the row pass.
+    T::with_buffer(|buf| {
+        let len = n_tbs * cols;
+        if buf.len() < len {
+            buf.resize(len, T::default());
+        }
+        let g = &mut buf[..len];
+        if tr_type {
+            // eq. 8-316 DST-VII, 4-point only.
+            for x in 0..cols {
+                for i in 0..4 {
+                    let mut acc = T::default();
+                    for j in 0..rows {
+                        acc = acc + T::from(DST4[j][i]) * T::from(d[j * d_stride + x]);
+                    }
+                    g[i * cols + x] = clip(acc);
+                }
             }
-            *yi = acc;
+            // §8.6.4 step 3: the row transform.
+            for (row, out) in g.chunks_exact(cols).zip(r.chunks_exact_mut(4)) {
+                for (i, o) in out.iter_mut().enumerate() {
+                    let mut acc = T::default();
+                    for (j, &v) in row.iter().enumerate() {
+                        acc = acc + T::from(DST4[j][i]) * v;
+                    }
+                    *o = finish(acc);
+                }
+            }
+            return;
         }
-        return;
-    }
-    idct_even_odd(x, nz, y);
+        let source = (d, d_stride);
+        match n_tbs {
+            4 => dct_passes::<T, 4, 2>(source, (cols, rows), clip, finish, g, r),
+            8 => dct_passes::<T, 8, 4>(source, (cols, rows), clip, finish, g, r),
+            16 => dct_passes::<T, 16, 8>(source, (cols, rows), clip, finish, g, r),
+            _ => dct_passes::<T, 32, 16>(source, (cols, rows), clip, finish, g, r),
+        }
+    });
 }
 
-/// The even / odd DCT-II synthesis of [`synthesize_1d`]; `x.len()` is
-/// the point count `n` (4 / 8 / 16 / 32), reading the §8.6.4.2 basis at
-/// stride `32 / n`.
-fn idct_even_odd<T: TransformAcc>(x: &[T], nz: usize, y: &mut [T]) {
-    let n = x.len();
-    let stride = 32 / n;
-    if n == 4 {
-        // Base case written out: rows 0 / 8 / 16 / 24 of the basis.
-        let (x0, x1, x2, x3) = (x[0], x[1], x[2], x[3]);
-        let b = |j: usize, i: usize| T::from(DCT32[j * stride][i]);
-        let e0 = b(0, 0) * x0 + b(2, 0) * x2;
-        let e1 = b(0, 1) * x0 + b(2, 1) * x2;
-        let (o0, o1) = if nz > 1 {
-            (b(1, 0) * x1 + b(3, 0) * x3, b(1, 1) * x1 + b(3, 1) * x3)
-        } else {
-            (T::default(), T::default())
-        };
-        y[0] = e0 + o0;
-        y[1] = e1 + o1;
-        y[2] = e1 - o1;
-        y[3] = e0 - o0;
+/// §8.6.4 for the `N`-point DCT-II (`HALF == N / 2`): steps 1 and 2
+/// over the first `cols` columns of `d` (row stride `d_stride`; rows
+/// from `rows` on are zero) into the `N × cols` array `g`, then step 3
+/// over every row of `g` into `r`, each output through `finish`.
+///
+/// Basis row 0 is the constant 64, so a lone input at `j == 0`
+/// synthesizes to 64 times itself at every output: a single non-zero
+/// row makes every row of `g` (and so of `r`) the same, and a single
+/// non-zero column makes each row of `r` one value. Both cases compute
+/// those values once.
+fn dct_passes<T: TransformAcc, const N: usize, const HALF: usize>(
+    (d, d_stride): (&[i32], usize),
+    (cols, rows): (usize, usize),
+    clip: impl Fn(T) -> T,
+    finish: impl Fn(T) -> i32,
+    g: &mut [T],
+    r: &mut [i32],
+) {
+    let dc = T::from(64);
+    if rows == 1 {
+        let first = &mut g[..cols];
+        for (v, &x) in first.iter_mut().zip(&d[..cols]) {
+            *v = clip(dc * T::from(x));
+        }
+        let (even, odd) = dct_synthesis::<T, N, HALF>(first);
+        let out = &mut r[..N];
+        for i in 0..HALF {
+            out[i] = finish(even[i] + odd[i]);
+            out[N - 1 - i] = finish(even[i] - odd[i]);
+        }
+        for y in 1..N {
+            r.copy_within(..N, y * N);
+        }
         return;
     }
-    let half = n / 2;
-    // Even part: the n/2-point synthesis of x[0], x[2], ... (the same
-    // basis rows at twice the stride).
-    let mut even_in = [T::default(); 16];
-    for (m, e) in even_in.iter_mut().enumerate().take(half) {
-        *e = x[2 * m];
+    // §8.6.4 steps 1 and 2, four columns at a time.
+    let mut x = 0;
+    while x + 4 <= cols {
+        column_group::<T, N, HALF, 4>((d, d_stride), rows, x, cols, &clip, g);
+        x += 4;
     }
-    let mut even_out = [T::default(); 16];
-    idct_even_odd(&even_in[..half], nz.div_ceil(2), &mut even_out[..half]);
-    // Odd part over the odd inputs that may be non-zero.
-    let odd_n = nz / 2;
-    for i in 0..half {
-        let mut o = T::default();
-        for m in 0..odd_n {
-            let j = 2 * m + 1;
-            o = o + T::from(DCT32[j * stride][i]) * x[j];
+    while x < cols {
+        column_group::<T, N, HALF, 1>((d, d_stride), rows, x, cols, &clip, g);
+        x += 1;
+    }
+    if cols == 1 {
+        for (out, &v) in r.chunks_exact_mut(N).zip(&*g) {
+            out.fill(finish(dc * v));
         }
-        y[i] = even_out[i] + o;
-        y[n - 1 - i] = even_out[i] - o;
+        return;
     }
+    for (row, out) in g.chunks_exact(cols).zip(r.chunks_exact_mut(N)) {
+        let (even, odd) = dct_synthesis::<T, N, HALF>(row);
+        for i in 0..HALF {
+            out[i] = finish(even[i] + odd[i]);
+            out[N - 1 - i] = finish(even[i] - odd[i]);
+        }
+    }
+}
+
+/// [`dct_passes`] steps 1 and 2 for the `L` columns from `x` (inputs
+/// `rows` deep, row stride `d_stride`): the even-`j` and the odd-`j`
+/// partial sums of each output `i < N / 2`, accumulated one half at a
+/// time with the even half parked in `g`, then combined into rows `i`
+/// and `N − 1 − i` of the `cols`-wide `g`. The same integer sums as
+/// [`dct_synthesis`], only grouped across columns.
+#[inline(always)]
+fn column_group<T: TransformAcc, const N: usize, const HALF: usize, const L: usize>(
+    (d, d_stride): (&[i32], usize),
+    rows: usize,
+    x: usize,
+    cols: usize,
+    clip: &impl Fn(T) -> T,
+    g: &mut [T],
+) {
+    let stride = 32 / N;
+    let half_sums = |first: usize| {
+        let mut acc = [[T::default(); L]; HALF];
+        for j in (first..rows).step_by(2) {
+            let v: &[i32; L] = d[j * d_stride + x..j * d_stride + x + L]
+                .try_into()
+                .unwrap();
+            let m: &[i32; HALF] = DCT32[j * stride][..HALF].try_into().unwrap();
+            for (a, &m) in acc.iter_mut().zip(m) {
+                for (a, &v) in a.iter_mut().zip(v) {
+                    *a = *a + T::from(m) * T::from(v);
+                }
+            }
+        }
+        acc
+    };
+    for (i, e) in half_sums(0).iter().enumerate() {
+        g[i * cols + x..i * cols + x + L].copy_from_slice(e);
+    }
+    for (i, o) in half_sums(1).iter().enumerate() {
+        for (l, &o) in o.iter().enumerate() {
+            let e = g[i * cols + x + l];
+            g[i * cols + x + l] = clip(e + o);
+            g[(N - 1 - i) * cols + x + l] = clip(e - o);
+        }
+    }
+}
+
+/// One `N`-point DCT-II synthesis `y[ i ] = Σ_j M[ j ][ i ] · x[ j ]`
+/// over the leading inputs `x` (later inputs are zero), returned as the
+/// even-`j` and odd-`j` partial sums for `i < N / 2`.
+///
+/// The `N`-point basis is row `j · 32 / N` of `DCT32`; it satisfies
+/// `M[ j ][ N − 1 − i ] = (−1)^j · M[ j ][ i ]`, so `y[ i ]` and
+/// `y[ N − 1 − i ]` are the sum and the difference of the two partial
+/// sums: the same integer matrix product, only re-associated.
+#[inline(always)]
+fn dct_synthesis<T: TransformAcc, const N: usize, const HALF: usize>(
+    x: &[T],
+) -> ([T; HALF], [T; HALF]) {
+    let stride = 32 / N;
+    let mut even = [T::default(); HALF];
+    let mut odd = [T::default(); HALF];
+    let pairs = x.chunks_exact(2);
+    let last = pairs.remainder();
+    for (j, pair) in pairs.enumerate() {
+        let (v0, v1) = (pair[0], pair[1]);
+        let m0: &[i32; HALF] = DCT32[2 * j * stride][..HALF].try_into().unwrap();
+        let m1: &[i32; HALF] = DCT32[(2 * j + 1) * stride][..HALF].try_into().unwrap();
+        for i in 0..HALF {
+            even[i] = even[i] + T::from(m0[i]) * v0;
+            odd[i] = odd[i] + T::from(m1[i]) * v1;
+        }
+    }
+    if let [v] = *last {
+        let j = x.len() - 1;
+        let m: &[i32; HALF] = DCT32[j * stride][..HALF].try_into().unwrap();
+        for i in 0..HALF {
+            even[i] = even[i] + T::from(m[i]) * v;
+        }
+    }
+    (even, odd)
 }
 
 /// Inputs to the §8.6.2 scaling-and-transformation orchestration that
@@ -740,8 +1028,8 @@ pub fn residual_block(
         return Ok(r);
     }
 
-    // §8.6.2 ordered step 1: §8.6.3 scaling process -> d.
-    let d = scale_coefficients(
+    // §8.6.2 ordered step 1: the §8.6.3 scaling process.
+    let scaler = Scaler::new(
         levels,
         n_tbs,
         params.q_p,
@@ -756,8 +1044,11 @@ pub fn residual_block(
         if params.extended_precision { 11 } else { 0 },
     );
 
-    // §8.6.2 ordered step 2.
-    let pre = if params.transform_skip {
+    // §8.6.2 ordered steps 2 and 3. Step 3 (eq. 8-299) is
+    // r = (r + (1 << (bdShift - 1))) >> bdShift; bdShift == 0 happens only
+    // under extended precision with bitDepth == 20 (outside the 8..=16
+    // domain), the no-shift identity.
+    if params.transform_skip {
         // eq. 8-298: r[x][y] = (rotate ? d[n-x-1][n-y-1] : d[x][y]) << tsShift.
         let ts_shift = 5 + log2_tbs as i32;
         let mut r = vec![0i32; count];
@@ -768,34 +1059,31 @@ pub fn residual_block(
                 } else {
                     (x, y)
                 };
-                r[y * n_tbs + x] = ((d[sy * n_tbs + sx] as i64) << ts_shift) as i32;
+                let d = scaler.scale(levels[sy * n_tbs + sx], sx, sy);
+                r[y * n_tbs + x] = ((d as i64) << ts_shift) as i32;
             }
         }
-        r
-    } else {
-        // §8.6.4 transformation process.
-        inverse_transform(
-            &d,
-            n_tbs,
-            params.pred_mode,
-            params.component,
-            params.bit_depth,
-            params.extended_precision,
-        )?
-    };
-
-    // §8.6.2 ordered step 3 (eq. 8-299): r = (r + (1 << (bdShift-1))) >> bdShift,
-    // in place over the transform output.
-    let mut r = pre;
-    if bd_shift > 0 {
-        let round = 1i64 << (bd_shift - 1);
-        for rv in r.iter_mut() {
-            *rv = (((*rv as i64) + round) >> bd_shift) as i32;
+        if bd_shift > 0 {
+            let round = 1i64 << (bd_shift - 1);
+            for rv in r.iter_mut() {
+                *rv = (((*rv as i64) + round) >> bd_shift) as i32;
+            }
         }
+        return Ok(r);
     }
-    // bdShift == 0 only under extended-precision with bitDepth == 20
-    // (out of our 8..=16 domain): the no-shift identity.
-    Ok(r)
+    // §8.6.4 transformation process (trType 1 iff MODE_INTRA, nTbS == 4,
+    // cIdx == 0), with the eq. 8-299 round applied to its output.
+    let tr_type = matches!(params.pred_mode, PredMode::Intra)
+        && n_tbs == 4
+        && matches!(params.component, Component::Luma);
+    Ok(scaled_inverse_transform(
+        levels,
+        n_tbs,
+        &scaler,
+        tr_type,
+        (params.bit_depth, params.extended_precision),
+        bd_shift,
+    ))
 }
 
 /// §8.6.5 — residual modification process for blocks using a transform
@@ -1188,70 +1476,148 @@ mod tests {
         assert_eq!(y2[1], DCT32[4][1] as i64); // 75
     }
 
-    /// The even / odd synthesis equals the literal eq. 8-317 / 8-316
-    /// matrix product on every basis vector (both are linear, so this
-    /// pins them equal on every input) at every block size, for both
-    /// accumulator types.
+    /// Literal §8.6.4 reference: dense eq. 8-315 / 8-316 column
+    /// products, the eq. 8-314 clip, then dense row products.
+    fn dense_inverse(d: &[i32], n: usize, tr_type: bool, coeff: (i32, i32)) -> Vec<i32> {
+        let (lo, hi) = (i64::from(coeff.0), i64::from(coeff.1));
+        let mut e = vec![0i64; n * n];
+        for x in 0..n {
+            let col: Vec<i64> = (0..n).map(|y| i64::from(d[y * n + x])).collect();
+            for (y, &v) in transform_1d(&col, n, tr_type).iter().enumerate() {
+                e[y * n + x] = clip3(lo, hi, (v + 64) >> 7);
+            }
+        }
+        let mut out = vec![0i32; n * n];
+        for (y, row) in e.chunks_exact(n).enumerate() {
+            for (x, &v) in transform_1d(row, n, tr_type).iter().enumerate() {
+                out[y * n + x] = v as i32;
+            }
+        }
+        out
+    }
+
+    /// The two-pass inverse transform equals the literal dense matrix
+    /// form at every block size and trType, on both accumulator paths:
+    /// every single-coefficient block, plus pseudo-random blocks of
+    /// short, medium and full non-zero extents whose magnitudes reach
+    /// the eq. 8-314 intermediate clip.
     #[test]
-    fn even_odd_synthesis_matches_matrix_product_on_the_basis() {
-        for &n in &[4usize, 8, 16, 32] {
-            for tr_type in [false, true] {
-                if tr_type && n != 4 {
-                    continue;
+    fn inverse_transform_matches_dense_matrix_product() {
+        let mut seed = 0x1234_5678u32;
+        let mut next = move |mag: i32| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((seed >> 4) as i32).rem_euclid(2 * mag + 1) - mag
+        };
+        for (n, intra) in [(4, true), (4, false), (8, false), (16, false), (32, false)] {
+            let mode = if intra {
+                PredMode::Intra
+            } else {
+                PredMode::Inter
+            };
+            for (bit_depth, extended) in [(10u8, false), (16u8, true)] {
+                let coeff = coeff_range(bit_depth, extended);
+                let check = |d: &[i32], what: &str| {
+                    let fast = inverse_transform(d, n, mode, Component::Luma, bit_depth, extended)
+                        .unwrap();
+                    let dense = dense_inverse(d, n, intra, coeff);
+                    assert_eq!(
+                        fast, dense,
+                        "n {n} intra {intra} extended {extended} {what}"
+                    );
+                };
+                for pos in 0..n * n {
+                    let mut d = vec![0i32; n * n];
+                    d[pos] = next(coeff.1);
+                    check(&d, &format!("single coefficient {pos}"));
                 }
-                for j in 0..n {
-                    let mut x = vec![0i64; n];
-                    x[j] = 7;
-                    let direct = transform_1d(&x, n, tr_type);
-                    let mut fast64 = vec![0i64; n];
-                    synthesize_1d(&x, n, tr_type, &mut fast64);
-                    assert_eq!(fast64, direct, "n {n} tr {tr_type} basis {j}");
-                    // With the non-zero extent declared exactly.
-                    let mut fast_nz = vec![0i64; n];
-                    synthesize_1d(&x, j + 1, tr_type, &mut fast_nz);
-                    assert_eq!(fast_nz, direct, "nz n {n} tr {tr_type} basis {j}");
-                    let x32: Vec<i32> = x.iter().map(|&v| v as i32).collect();
-                    let mut fast32 = vec![0i32; n];
-                    synthesize_1d(&x32, n, tr_type, &mut fast32);
-                    let fast32: Vec<i64> = fast32.iter().map(|&v| i64::from(v)).collect();
-                    assert_eq!(fast32, direct, "i32 n {n} tr {tr_type} basis {j}");
+                let extents = [1, 2, 3, n / 2 + 1, n];
+                for &ey in &extents {
+                    for &ex in &extents {
+                        let mut d = vec![0i32; n * n];
+                        for row in d.chunks_exact_mut(n).take(ey) {
+                            for v in &mut row[..ex] {
+                                *v = next(coeff.1);
+                            }
+                        }
+                        check(&d, &format!("extent {ex}x{ey}"));
+                    }
                 }
             }
         }
     }
 
-    /// The sparse two-pass inverse equals the dense matrix form on a
-    /// pseudo-random 32x32 block with a short non-zero extent.
+    /// `residual_block` scales only the levels' non-zero extent and folds
+    /// the eq. 8-299 round into the transform; it equals the literal
+    /// §8.6.2 order — scale every coefficient, transform, then round — at
+    /// every size, on both accumulator paths, with flat and explicit
+    /// scaling matrices, including coded levels that scale to zero.
     #[test]
-    fn sparse_inverse_matches_dense_passes() {
-        let n = 32usize;
-        let mut d = vec![0i32; n * n];
-        let mut seed = 0x1234_5678u32;
-        for y in 0..5 {
-            for x in 0..7 {
-                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                d[y * n + x] = ((seed >> 8) as i32 % 2001) - 1000;
+    fn residual_block_matches_scale_transform_round() {
+        let mut seed = 0x9e37_79b9u32;
+        let mut next = move |mag: i32| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((seed >> 4) as i32).rem_euclid(2 * mag + 1) - mag
+        };
+        for (n, intra) in [(4, true), (4, false), (8, false), (16, false), (32, false)] {
+            let pred_mode = if intra {
+                PredMode::Intra
+            } else {
+                PredMode::Inter
+            };
+            let matrix = ScalingFactorMatrix {
+                dim: n as u8,
+                coef: (0..n * n).map(|i| 1 + (i * 37 % 64) as u16).collect(),
+            };
+            for (bit_depth, extended, q_p) in [(8u8, false, 4u32), (10, false, 37), (16, true, 51)]
+            {
+                for scaling in [None, Some(&matrix)] {
+                    for (ex, ey) in [(1, 1), (2, 3), (n / 2 + 1, n), (n, n)] {
+                        let mut levels = vec![0i32; n * n];
+                        for row in levels.chunks_exact_mut(n).take(ey) {
+                            for v in &mut row[..ex] {
+                                *v = next(300);
+                            }
+                        }
+                        let params = BlockParams {
+                            n_tbs: n,
+                            q_p,
+                            component: Component::Luma,
+                            pred_mode,
+                            bit_depth,
+                            extended_precision: extended,
+                            transquant_bypass: false,
+                            transform_skip: false,
+                            transform_skip_rotation_enabled: false,
+                        };
+                        let d = scale_coefficients(&levels, n, q_p, bit_depth, extended, scaling)
+                            .unwrap();
+                        let pre = inverse_transform(
+                            &d,
+                            n,
+                            pred_mode,
+                            Component::Luma,
+                            bit_depth,
+                            extended,
+                        )
+                        .unwrap();
+                        let bd_shift =
+                            (20 - i32::from(bit_depth)).max(if extended { 11 } else { 0 });
+                        let round = 1i64 << (bd_shift - 1);
+                        let expected: Vec<i32> = pre
+                            .iter()
+                            .map(|&v| ((i64::from(v) + round) >> bd_shift) as i32)
+                            .collect();
+                        assert_eq!(
+                            residual_block(&levels, scaling, params).unwrap(),
+                            expected,
+                            "n {n} intra {intra} bit depth {bit_depth} extended {extended} \
+                             matrix {} extent {ex}x{ey}",
+                            scaling.is_some()
+                        );
+                    }
+                }
             }
         }
-        let fast = inverse_transform(&d, n, PredMode::Inter, Component::Luma, 8, false).unwrap();
-        // Dense reference: literal column then row products.
-        let mut e = vec![0i64; n * n];
-        for x in 0..n {
-            let col: Vec<i64> = (0..n).map(|y| i64::from(d[y * n + x])).collect();
-            let te = transform_1d(&col, n, false);
-            for (y, &v) in te.iter().enumerate() {
-                e[y * n + x] = clip3(-32768, 32767, (v + 64) >> 7);
-            }
-        }
-        let mut dense = vec![0i32; n * n];
-        for y in 0..n {
-            let row: Vec<i64> = (0..n).map(|x| e[y * n + x]).collect();
-            let tr = transform_1d(&row, n, false);
-            for (x, &v) in tr.iter().enumerate() {
-                dense[y * n + x] = v as i32;
-            }
-        }
-        assert_eq!(fast, dense);
     }
 
     /// §8.6.5 eq. 8-322 — horizontal RDPCM is a running sum along each

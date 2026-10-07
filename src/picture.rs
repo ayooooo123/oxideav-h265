@@ -102,15 +102,35 @@ impl Picture {
         bit_depth_luma: u8,
         bit_depth_chroma: u8,
     ) -> Self {
+        Self::with_planes(
+            width_luma,
+            height_luma,
+            chroma_array_type,
+            bit_depth_luma,
+            bit_depth_chroma,
+            |len| vec![0u16; len],
+        )
+    }
+
+    /// [`Self::new`] with each plane's `len` zero samples supplied by
+    /// `zeroed` (a fresh or a reused buffer).
+    pub(crate) fn with_planes(
+        width_luma: usize,
+        height_luma: usize,
+        chroma_array_type: u8,
+        bit_depth_luma: u8,
+        bit_depth_chroma: u8,
+        mut zeroed: impl FnMut(usize) -> Vec<u16>,
+    ) -> Self {
         let (width_chroma, height_chroma) = if chroma_array_type == 0 {
             (0, 0)
         } else {
             let (sw, sh) = sub_wh_c(chroma_array_type);
             (width_luma / sw, height_luma / sh)
         };
-        let luma = Arc::new(vec![0u16; width_luma * height_luma]);
-        let cb = Arc::new(vec![0u16; width_chroma * height_chroma]);
-        let cr = Arc::new(vec![0u16; width_chroma * height_chroma]);
+        let luma = Arc::new(zeroed(width_luma * height_luma));
+        let cb = Arc::new(zeroed(width_chroma * height_chroma));
+        let cr = Arc::new(zeroed(width_chroma * height_chroma));
         Self {
             width_luma,
             height_luma,
@@ -351,6 +371,13 @@ impl Picture {
     pub fn into_planes(self) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
         let take = |a: Arc<Vec<u16>>| Arc::try_unwrap(a).unwrap_or_else(|a| (*a).clone());
         (take(self.luma), take(self.cb), take(self.cr))
+    }
+
+    /// The three sample buffers (`Y` / `Cb` / `Cr`) without copying: a
+    /// plane still shared with another `Picture` stays alive there, a
+    /// uniquely held one is freed when its buffer is dropped.
+    pub(crate) fn into_shared_planes(self) -> [Arc<Vec<u16>>; 3] {
+        [self.luma, self.cb, self.cr]
     }
 
     /// Whether the sample planes are shared with another `Picture`

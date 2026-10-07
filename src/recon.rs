@@ -629,7 +629,7 @@ fn predict_add_store(
 // §8.5 inter sample reconstruction
 // ---------------------------------------------------------------------------
 
-use crate::inter_pred::{InterPredGeometry, InterPrediction, ListPrediction, RefPlane};
+use crate::inter_pred::{InterPredGeometry, ListPrediction, RefPlane};
 
 /// One reference list's fully-resolved per-PU motion: the
 /// §8.5.3.2-derived luma motion vector, the §8.5.3.2.10 chroma motion
@@ -748,6 +748,35 @@ pub fn reconstruct_inter_pu_weighted(
     residual_cr: Option<&[i32]>,
     weights: Option<&crate::inter_pred::PuWeights>,
 ) -> Result<(), ReconError> {
+    predict_inter_pu_into(pic, params, (x_pb, y_pb, n_pb_w, n_pb_h), l0, l1, weights)?;
+    if let Some(r) = residual_luma {
+        add_residual(pic, Plane::Luma, (x_pb, y_pb), (n_pb_w, n_pb_h), r);
+    }
+    if params.chroma_array_type != 0 {
+        let (sw, sh) = sub_wh_c(params.chroma_array_type);
+        let (xc, yc) = (x_pb / sw, y_pb / sh);
+        let size = (n_pb_w / sw, n_pb_h / sh);
+        for (plane, r) in [(Plane::Cb, residual_cb), (Plane::Cr, residual_cr)] {
+            if let Some(r) = r {
+                add_residual(pic, plane, (xc, yc), size, r);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// §8.5.3.3 — write one inter prediction unit's motion-compensated
+/// prediction samples for the PU rectangle `(xPb, yPb, nPbW, nPbH)` into
+/// `pic`. A coding unit's residual is added afterwards, transform block by
+/// transform block, by [`add_cu_residual`].
+pub(crate) fn predict_inter_pu_into(
+    pic: &mut Picture,
+    params: &ReconParams,
+    (x_pb, y_pb, n_pb_w, n_pb_h): (usize, usize, usize, usize),
+    l0: ResolvedList<'_>,
+    l1: ResolvedList<'_>,
+    weights: Option<&crate::inter_pred::PuWeights>,
+) -> Result<(), ReconError> {
     let cat = params.chroma_array_type;
     // Build the §8.5.3.3.2 reference planes for each used list.
     let lp0 = build_list_prediction(&l0, cat)?;
@@ -761,66 +790,57 @@ pub fn reconstruct_inter_pu_weighted(
         bit_depth_luma: params.bit_depth_luma,
         bit_depth_chroma: params.bit_depth_chroma,
     };
-    let InterPrediction { luma, cb, cr } =
-        crate::inter_pred::predict_inter_pu_weighted(&lp0, &lp1, &geom, weights)
-            .map_err(ReconError::InterPred)?;
-
-    // §8.6.5 / §8.4.4.1: recSamples = Clip1( predSamples + resSamples ).
-    write_inter_plane(
-        pic,
-        Plane::Luma,
-        x_pb,
-        y_pb,
-        n_pb_w,
-        n_pb_h,
-        &luma,
-        residual_luma,
-    );
-    if cat != 0 {
-        let (sw, sh) = sub_wh_c(cat);
-        let xc = x_pb / sw;
-        let yc = y_pb / sh;
-        let pcw = n_pb_w / sw;
-        let pch = n_pb_h / sh;
-        write_inter_plane(pic, Plane::Cb, xc, yc, pcw, pch, &cb, residual_cb);
-        write_inter_plane(pic, Plane::Cr, xc, yc, pcw, pch, &cr, residual_cr);
-    }
-    Ok(())
+    crate::inter_pred::for_each_plane_prediction(&lp0, &lp1, &geom, weights, |c_idx, pred| {
+        let (plane, x0, y0) = match c_idx {
+            0 => (Plane::Luma, x_pb, y_pb),
+            c => {
+                let (sw, sh) = sub_wh_c(cat);
+                let plane = if c == 1 { Plane::Cb } else { Plane::Cr };
+                (plane, x_pb / sw, y_pb / sh)
+            }
+        };
+        let (w, h) = pred.size();
+        let (buf, stride, (ox, oy)) = pic.plane_mut_origin(plane);
+        for y in 0..h {
+            let o = (y0 + y - oy) * stride + (x0 - ox);
+            pred.row(y, &mut buf[o..o + w]);
+        }
+    })
+    .map_err(ReconError::InterPred)
 }
 
-/// Write one motion-compensated prediction plane plus its optional
-/// residual into `pic` with the §8.4.4.1 clip.
-#[allow(clippy::too_many_arguments)]
-fn write_inter_plane(
+/// §8.6.7 — add the `w × h` row-major `residual` onto the samples of
+/// `plane` from `(x0, y0)`: `recSamples = Clip1( predSamples + resSamples
+/// )`.
+fn add_residual(
     pic: &mut Picture,
     plane: Plane,
-    x0: usize,
-    y0: usize,
-    w: usize,
-    h: usize,
-    pred: &[i32],
-    residual: Option<&[i32]>,
+    (x0, y0): (usize, usize),
+    (w, h): (usize, usize),
+    residual: &[i32],
 ) {
-    let bit_depth = pic.bit_depth(plane);
+    if w == 0 {
+        return;
+    }
+    let max = (1i32 << pic.bit_depth(plane)) - 1;
     let (buf, stride, (ox, oy)) = pic.plane_mut_origin(plane);
-    for y in 0..h {
+    for (y, r) in residual[..w * h].chunks_exact(w).enumerate() {
         let o = (y0 + y - oy) * stride + (x0 - ox);
-        let row = &mut buf[o..o + w];
-        let prow = &pred[y * w..(y + 1) * w];
-        match residual {
-            Some(r) => {
-                let rrow = &r[y * w..(y + 1) * w];
-                for ((d, &p), &r) in row.iter_mut().zip(prow).zip(rrow) {
-                    *d = clip1(p + r, bit_depth) as u16;
-                }
-            }
-            None => {
-                for (d, &p) in row.iter_mut().zip(prow) {
-                    *d = clip1(p, bit_depth) as u16;
-                }
-            }
+        for (d, &r) in buf[o..o + w].iter_mut().zip(r) {
+            *d = (i32::from(*d) + r).clamp(0, max) as u16;
         }
     }
+}
+
+/// [`add_residual`] for the `n × n` residual `block` of component `c` at
+/// component position `at` (chroma-subsampled for Cb / Cr).
+fn add_block(pic: &mut Picture, c: TfComponent, at: (usize, usize), n: usize, block: &[i32]) {
+    let plane = match c {
+        TfComponent::Luma => Plane::Luma,
+        TfComponent::Cb => Plane::Cb,
+        TfComponent::Cr => Plane::Cr,
+    };
+    add_residual(pic, plane, at, (n, n), block);
 }
 
 /// Map an `IpComponent` for the plane / cIdx pair.
@@ -833,357 +853,219 @@ fn ip_component_of(cidx: TfComponent) -> IpComponent {
     }
 }
 
-/// A per-coding-unit residual buffer for one component, sized to the luma
-/// coding block (luma) or its chroma sub-sampling (Cb / Cr). The §8.5
-/// inter reconstruction adds this onto the motion-compensated prediction.
-///
-/// The transform tree (§7.3.8.8) subdivides the coding block independently
-/// of the §7.3.8.6 prediction-unit partitioning, so the inter
-/// reconstruction first assembles the whole-CU residual (every leaf
-/// transform block's §8.6.2 dequant + inverse transform written into its
-/// position) and then slices out each prediction unit's covering region.
-#[derive(Debug, Clone)]
-pub struct CuResidualPlane {
-    /// Top-left x of the plane within its component (luma coordinates for
-    /// luma, chroma-subsampled coordinates for Cb / Cr).
-    pub x0: usize,
-    /// Top-left y of the plane.
-    pub y0: usize,
-    /// Plane width in samples.
-    pub width: usize,
-    /// Plane height in samples.
-    pub height: usize,
-    /// Row-major residual samples (`width * height`), zero where no
-    /// transform block coded coefficients.
-    pub samples: Vec<i32>,
-}
-
-impl CuResidualPlane {
-    /// A zero residual plane covering `(x0, y0)` of size `width × height`.
-    fn zeros(x0: usize, y0: usize, width: usize, height: usize) -> Self {
-        Self {
-            x0,
-            y0,
-            width,
-            height,
-            samples: vec![0; width * height],
-        }
-    }
-
-    /// Write a `n × n` residual sub-block at component position
-    /// `(bx, by)` (the block's top-left in the same coordinate system as
-    /// `x0`/`y0`), clipping to the plane bounds.
-    fn write_block(&mut self, bx: usize, by: usize, n: usize, block: &[i32]) {
-        for y in 0..n {
-            let py = by + y;
-            if py < self.y0 || py >= self.y0 + self.height {
-                continue;
-            }
-            for x in 0..n {
-                let px = bx + x;
-                if px < self.x0 || px >= self.x0 + self.width {
-                    continue;
-                }
-                let idx = (py - self.y0) * self.width + (px - self.x0);
-                self.samples[idx] = block[y * n + x];
-            }
-        }
-    }
-
-    /// Extract the `w × h` residual covering the prediction region at
-    /// component position `(rx, ry)` (row-major), zero-filling positions
-    /// outside this plane.
-    #[must_use]
-    pub fn slice_region(&self, rx: usize, ry: usize, w: usize, h: usize) -> Vec<i32> {
-        let mut out = vec![0; w * h];
-        for y in 0..h {
-            let py = ry + y;
-            if py < self.y0 || py >= self.y0 + self.height {
-                continue;
-            }
-            for x in 0..w {
-                let px = rx + x;
-                if px < self.x0 || px >= self.x0 + self.width {
-                    continue;
-                }
-                out[y * w + x] = self.samples[(py - self.y0) * self.width + (px - self.x0)];
-            }
-        }
-        out
-    }
-}
-
-/// The three per-component residual planes of one inter coding unit.
-#[derive(Debug, Clone)]
-pub struct CuResidual {
-    /// The luma residual plane (luma coordinates).
-    pub luma: CuResidualPlane,
-    /// The Cb residual plane (chroma-subsampled coordinates), absent for
-    /// monochrome.
-    pub cb: Option<CuResidualPlane>,
-    /// The Cr residual plane.
-    pub cr: Option<CuResidualPlane>,
-}
-
-impl CuResidual {
-    /// `true` when this CU codes no residual at all (skip / `rqt_root_cbf
-    /// == 0`); the prediction is written directly.
-    #[must_use]
-    pub fn is_zero(&self) -> bool {
-        let plane_zero = |p: &Option<CuResidualPlane>| match p {
-            Some(plane) => plane.samples.iter().all(|&s| s == 0),
-            None => true,
-        };
-        self.luma.samples.iter().all(|&s| s == 0) && plane_zero(&self.cb) && plane_zero(&self.cr)
-    }
-}
-
-/// §8.5 / §8.6.2 — assemble one inter coding unit's residual planes by
-/// walking its §7.3.8.8 transform tree, dequantizing + inverse-transforming
-/// each leaf transform block (`MODE_INTER` path) into its CU-relative
-/// position.
-///
-/// `(x_cb, y_cb)` is the CU's luma top-left; `n_cb_s` its luma side.
-/// `qp_y` is the §8.6.1-derived `QpY` of the CU (`SliceQpY` for the
-/// single-QG case). Returns `CuResidual` with the luma plane and — for a
-/// non-monochrome `ChromaArrayType` — the Cb / Cr planes.
+/// §8.6.7 — add one inter coding unit's residual onto its prediction in
+/// `pic`: §8.6.2 (the `MODE_INTER` path) for each transform block of the
+/// §7.3.8.8 transform `tree` rooted at the luma coding block `(x_cb,
+/// y_cb)` of side `1 << log2_cb_size`. The transform blocks tile the
+/// coding block without overlap, so each sample receives its one
+/// residual. `qp_y` is the CU's §8.6.1 `QpY`.
 ///
 /// # Errors
 /// Propagates [`ReconError::Transform`] from the §8.6.2 inverse transform.
-pub fn extract_cu_residual(
-    params: &ReconParams,
-    tree: Option<&TransformTree>,
-    x_cb: usize,
-    y_cb: usize,
-    n_cb_s: usize,
-    qp_y: i32,
-    transquant_bypass: bool,
-) -> Result<CuResidual, ReconError> {
-    let cat = params.chroma_array_type;
-    let mut luma = CuResidualPlane::zeros(x_cb, y_cb, n_cb_s, n_cb_s);
-    let (mut cb, mut cr) = if cat != 0 {
-        let (sw, sh) = sub_wh_c(cat);
-        let (cw, ch) = (n_cb_s / sw, n_cb_s / sh);
-        let (cx, cy) = (x_cb / sw, y_cb / sh);
-        (
-            Some(CuResidualPlane::zeros(cx, cy, cw, ch)),
-            Some(CuResidualPlane::zeros(cx, cy, cw, ch)),
-        )
-    } else {
-        (None, None)
-    };
-
-    if let Some(tree) = tree {
-        // The CU log2 size is the depth-0 transform-tree size.
-        let log2_cb = n_cb_s.trailing_zeros();
-        extract_residual_tree(
-            params,
-            tree,
-            x_cb,
-            y_cb,
-            log2_cb,
-            qp_y,
-            transquant_bypass,
-            &mut luma,
-            cb.as_mut(),
-            cr.as_mut(),
-        )?;
-    }
-
-    Ok(CuResidual { luma, cb, cr })
-}
-
-/// Recursive helper for [`extract_cu_residual`]: walk a transform-tree node
-/// and write each leaf's residual into the component planes.
-//
-// `as_deref_mut` here is the standard `Option<&mut T>` reborrow needed to
-// reuse the optional chroma planes across the four-child loop; clippy's
-// `needless_option_as_deref` misfires on the reborrow pattern.
-#[allow(clippy::too_many_arguments, clippy::needless_option_as_deref)]
-fn extract_residual_tree(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_cu_residual(
+    pic: &mut Picture,
     params: &ReconParams,
     tree: &TransformTree,
-    x0: usize,
-    y0: usize,
-    log2_trafo_size: u32,
+    x_cb: usize,
+    y_cb: usize,
+    log2_cb_size: u32,
     qp_y: i32,
     transquant_bypass: bool,
-    luma: &mut CuResidualPlane,
-    mut cb: Option<&mut CuResidualPlane>,
-    mut cr: Option<&mut CuResidualPlane>,
 ) -> Result<(), ReconError> {
-    match tree {
-        TransformTree::Split { children, .. } => {
-            let half = 1usize << (log2_trafo_size - 1);
-            let offsets = [(0, 0), (half, 0), (0, half), (half, half)];
-            for (child, (dx, dy)) in children.iter().zip(offsets) {
-                extract_residual_tree(
-                    params,
-                    child,
-                    x0 + dx,
-                    y0 + dy,
-                    log2_trafo_size - 1,
-                    qp_y,
-                    transquant_bypass,
-                    luma,
-                    cb.as_deref_mut(),
-                    cr.as_deref_mut(),
-                )?;
+    let walk = ResidualWalk {
+        params,
+        qp_y,
+        transquant_bypass,
+    };
+    walk.tree(pic, tree, x_cb, y_cb, log2_cb_size)
+}
+
+/// The CU-constant inputs of the inter residual walk.
+struct ResidualWalk<'a> {
+    params: &'a ReconParams,
+    qp_y: i32,
+    transquant_bypass: bool,
+}
+
+impl ResidualWalk<'_> {
+    /// Walk a transform-tree node, adding each leaf's residual blocks
+    /// onto `pic`.
+    fn tree(
+        &self,
+        pic: &mut Picture,
+        tree: &TransformTree,
+        x0: usize,
+        y0: usize,
+        log2_trafo_size: u32,
+    ) -> Result<(), ReconError> {
+        let &Self {
+            params,
+            qp_y,
+            transquant_bypass,
+        } = self;
+        match tree {
+            TransformTree::Split { children, .. } => {
+                let half = 1usize << (log2_trafo_size - 1);
+                let offsets = [(0, 0), (half, 0), (0, half), (half, half)];
+                for (child, (dx, dy)) in children.iter().zip(offsets) {
+                    self.tree(pic, child, x0 + dx, y0 + dy, log2_trafo_size - 1)?;
+                }
+                Ok(())
             }
-            Ok(())
-        }
-        TransformTree::Leaf { unit, .. } => {
-            let n_tbs = 1usize << log2_trafo_size;
-            // §7.4.9.10 — thread the CuQpOffsetCb / CuQpOffsetCr state
-            // in decode order on the inter residual path too.
-            if let Some(off) = &unit.cu_chroma_qp_offset {
-                apply_cu_chroma_qp_offset(params, off);
-            }
-            // §8.5.4.1 step 4 — a tu_residual_act_flag == 1 unit
-            // (4:4:4) derives all three co-located residual arrays
-            // (ACT-adjusted qP), applies cross-component prediction,
-            // then the §8.6.8.2 inverse colour transform, before the
-            // arrays land in the CU planes.
-            if unit.tu_residual_act_flag == 1 && params.chroma_array_type == 3 {
-                let mut r_y = match &unit.residual_luma {
-                    Some(rb) => inter_residual_block(
-                        params,
-                        rb,
-                        TfComponent::Luma,
-                        luma_qp_act(params, qp_y),
-                        transquant_bypass,
-                    )?,
-                    None => vec![0i32; n_tbs * n_tbs],
-                };
-                let chroma_res = |blocks: &[crate::residual::ResidualBlock],
-                                  coded: bool,
-                                  cidx: TfComponent|
-                 -> Result<Vec<i32>, ReconError> {
-                    match blocks.first() {
-                        Some(rb) if coded => inter_residual_block(
+            TransformTree::Leaf { unit, .. } => {
+                let n_tbs = 1usize << log2_trafo_size;
+                // §7.4.9.10 — thread the CuQpOffsetCb / CuQpOffsetCr state
+                // in decode order on the inter residual path too.
+                if let Some(off) = &unit.cu_chroma_qp_offset {
+                    apply_cu_chroma_qp_offset(params, off);
+                }
+                // §8.5.4.1 step 4 — a tu_residual_act_flag == 1 unit
+                // (4:4:4) derives all three co-located residual arrays
+                // (ACT-adjusted qP), applies cross-component prediction,
+                // then the §8.6.8.2 inverse colour transform, before the
+                // arrays are added onto the prediction.
+                if unit.tu_residual_act_flag == 1 && params.chroma_array_type == 3 {
+                    let mut r_y = match &unit.residual_luma {
+                        Some(rb) => inter_residual_block(
                             params,
                             rb,
-                            cidx,
-                            chroma_qp_act(params, qp_y, cidx, true),
+                            TfComponent::Luma,
+                            luma_qp_act(params, qp_y),
                             transquant_bypass,
+                        )?,
+                        None => vec![0i32; n_tbs * n_tbs],
+                    };
+                    let chroma_res = |blocks: &[crate::residual::ResidualBlock],
+                                      coded: bool,
+                                      cidx: TfComponent|
+                     -> Result<Vec<i32>, ReconError> {
+                        match blocks.first() {
+                            Some(rb) if coded => inter_residual_block(
+                                params,
+                                rb,
+                                cidx,
+                                chroma_qp_act(params, qp_y, cidx, true),
+                                transquant_bypass,
+                            ),
+                            _ => Ok(vec![0i32; n_tbs * n_tbs]),
+                        }
+                    };
+                    let mut r_cb =
+                        chroma_res(&unit.residual_cb, unit.cbf_cb_halves[0], TfComponent::Cb)?;
+                    let mut r_cr =
+                        chroma_res(&unit.residual_cr, unit.cbf_cr_halves[0], TfComponent::Cr)?;
+                    for (r, ccp) in [
+                        (&mut r_cb, unit.cross_comp_pred_cb.as_ref()),
+                        (&mut r_cr, unit.cross_comp_pred_cr.as_ref()),
+                    ] {
+                        if let Some(c) =
+                            CcpInput::resolve(params.chroma_array_type, ccp, Some(&r_y))
+                        {
+                            apply_cross_comp_pred(
+                                r,
+                                c.luma_residual,
+                                c.res_scale_val,
+                                params.bit_depth_luma,
+                                params.bit_depth_chroma,
+                            );
+                        }
+                    }
+                    crate::transform::act_inverse(
+                        &mut r_y,
+                        &mut r_cb,
+                        &mut r_cr,
+                        params.bit_depth_luma,
+                        params.bit_depth_chroma,
+                        params.extended_precision,
+                        transquant_bypass,
+                    );
+                    add_block(pic, TfComponent::Luma, (x0, y0), n_tbs, &r_y);
+                    add_block(pic, TfComponent::Cb, (x0, y0), n_tbs, &r_cb);
+                    add_block(pic, TfComponent::Cr, (x0, y0), n_tbs, &r_cr);
+                    return Ok(());
+                }
+                // Luma residual (§8.6.2 with the MODE_INTER path). The
+                // array is kept for the §8.5.4.3 step-5 cross-component
+                // prediction of this unit's chroma blocks (4:4:4).
+                let luma_res: Option<Vec<i32>> = match &unit.residual_luma {
+                    Some(rb) => {
+                        let qp = luma_qp(params, qp_y);
+                        let res = inter_residual_block(
+                            params,
+                            rb,
+                            TfComponent::Luma,
+                            qp,
+                            transquant_bypass,
+                        )?;
+                        add_block(pic, TfComponent::Luma, (x0, y0), n_tbs, &res);
+                        Some(res)
+                    }
+                    None => None,
+                };
+                // Chroma residuals, positioned at the chroma-subsampled
+                // coordinates of this luma node. §7.3.8.10 deferred chroma:
+                // a 4×4 luma leaf (ChromaArrayType != 3) carries no chroma
+                // of its own — the blkIdx == 3 child holds the PARENT
+                // node's chroma blocks, positioned at ( xBase, yBase ), the
+                // 8×8 parent's top-left (x0 / y0 with the low 3 bits
+                // cleared).
+                if params.chroma_array_type != 0 {
+                    let (x_base, y_base) = if log2_trafo_size == 2 && params.chroma_array_type != 3
+                    {
+                        (x0 & !7, y0 & !7)
+                    } else {
+                        (x0, y0)
+                    };
+                    let (sw, sh) = sub_wh_c(params.chroma_array_type);
+                    let (xc, yc) = (x_base / sw, y_base / sh);
+                    let luma_res = luma_res.as_deref();
+                    let ccp_cb = CcpInput::resolve(
+                        params.chroma_array_type,
+                        unit.cross_comp_pred_cb.as_ref(),
+                        luma_res,
+                    );
+                    let ccp_cr = CcpInput::resolve(
+                        params.chroma_array_type,
+                        unit.cross_comp_pred_cr.as_ref(),
+                        luma_res,
+                    );
+                    for (cidx, blocks, halves, ccp) in [
+                        (
+                            TfComponent::Cb,
+                            &unit.residual_cb,
+                            unit.cbf_cb_halves,
+                            ccp_cb,
                         ),
-                        _ => Ok(vec![0i32; n_tbs * n_tbs]),
+                        (
+                            TfComponent::Cr,
+                            &unit.residual_cr,
+                            unit.cbf_cr_halves,
+                            ccp_cr,
+                        ),
+                    ] {
+                        add_chroma_residual_blocks(
+                            params,
+                            blocks,
+                            halves,
+                            cidx,
+                            chroma_qp(params, qp_y, cidx),
+                            transquant_bypass,
+                            xc,
+                            yc,
+                            n_tbs,
+                            ccp,
+                            pic,
+                        )?;
                     }
-                };
-                let mut r_cb =
-                    chroma_res(&unit.residual_cb, unit.cbf_cb_halves[0], TfComponent::Cb)?;
-                let mut r_cr =
-                    chroma_res(&unit.residual_cr, unit.cbf_cr_halves[0], TfComponent::Cr)?;
-                for (r, ccp) in [
-                    (&mut r_cb, unit.cross_comp_pred_cb.as_ref()),
-                    (&mut r_cr, unit.cross_comp_pred_cr.as_ref()),
-                ] {
-                    if let Some(c) = CcpInput::resolve(params.chroma_array_type, ccp, Some(&r_y)) {
-                        apply_cross_comp_pred(
-                            r,
-                            c.luma_residual,
-                            c.res_scale_val,
-                            params.bit_depth_luma,
-                            params.bit_depth_chroma,
-                        );
-                    }
                 }
-                crate::transform::act_inverse(
-                    &mut r_y,
-                    &mut r_cb,
-                    &mut r_cr,
-                    params.bit_depth_luma,
-                    params.bit_depth_chroma,
-                    params.extended_precision,
-                    transquant_bypass,
-                );
-                luma.write_block(x0, y0, n_tbs, &r_y);
-                if let Some(plane) = cb {
-                    plane.write_block(x0, y0, n_tbs, &r_cb);
-                }
-                if let Some(plane) = cr {
-                    plane.write_block(x0, y0, n_tbs, &r_cr);
-                }
-                return Ok(());
+                Ok(())
             }
-            // Luma residual (§8.6.2 with the MODE_INTER path). The
-            // array is kept for the §8.5.4.3 step-5 cross-component
-            // prediction of this unit's chroma blocks (4:4:4).
-            let luma_res: Option<Vec<i32>> = match &unit.residual_luma {
-                Some(rb) => {
-                    let qp = luma_qp(params, qp_y);
-                    let res =
-                        inter_residual_block(params, rb, TfComponent::Luma, qp, transquant_bypass)?;
-                    luma.write_block(x0, y0, n_tbs, &res);
-                    Some(res)
-                }
-                None => None,
-            };
-            // Chroma residuals, positioned at the chroma-subsampled
-            // coordinates of this luma node. §7.3.8.10 deferred chroma:
-            // a 4×4 luma leaf (ChromaArrayType != 3) carries no chroma
-            // of its own — the blkIdx == 3 child holds the PARENT
-            // node's chroma blocks, positioned at ( xBase, yBase ), the
-            // 8×8 parent's top-left (x0 / y0 with the low 3 bits
-            // cleared).
-            if params.chroma_array_type != 0 {
-                let (x_base, y_base) = if log2_trafo_size == 2 && params.chroma_array_type != 3 {
-                    (x0 & !7, y0 & !7)
-                } else {
-                    (x0, y0)
-                };
-                let (sw, sh) = sub_wh_c(params.chroma_array_type);
-                let (xc, yc) = (x_base / sw, y_base / sh);
-                let luma_res = luma_res.as_deref();
-                let ccp_cb = CcpInput::resolve(
-                    params.chroma_array_type,
-                    unit.cross_comp_pred_cb.as_ref(),
-                    luma_res,
-                );
-                let ccp_cr = CcpInput::resolve(
-                    params.chroma_array_type,
-                    unit.cross_comp_pred_cr.as_ref(),
-                    luma_res,
-                );
-                if let Some(plane) = cb {
-                    let qp = chroma_qp(params, qp_y, TfComponent::Cb);
-                    write_chroma_residual_blocks(
-                        params,
-                        &unit.residual_cb,
-                        unit.cbf_cb_halves,
-                        TfComponent::Cb,
-                        qp,
-                        transquant_bypass,
-                        xc,
-                        yc,
-                        n_tbs,
-                        ccp_cb,
-                        plane,
-                    )?;
-                }
-                if let Some(plane) = cr {
-                    let qp = chroma_qp(params, qp_y, TfComponent::Cr);
-                    write_chroma_residual_blocks(
-                        params,
-                        &unit.residual_cr,
-                        unit.cbf_cr_halves,
-                        TfComponent::Cr,
-                        qp,
-                        transquant_bypass,
-                        xc,
-                        yc,
-                        n_tbs,
-                        ccp_cr,
-                        plane,
-                    )?;
-                }
-            }
-            Ok(())
         }
     }
 }
 
-/// Write a transform unit's chroma residual blocks into `plane`. The
+/// Add a transform unit's chroma residual blocks onto `pic`. The
 /// `ChromaArrayType == 2` lower-half companion (when present as a second
 /// block) is positioned `1 << log2TrafoSizeC` samples below the first.
 ///
@@ -1192,7 +1074,7 @@ fn extract_residual_tree(
 /// modification must materialize a block whose cbf is clear. `ccp`
 /// carries the §8.5.4.3 step-5 cross-component prediction input.
 #[allow(clippy::too_many_arguments)]
-fn write_chroma_residual_blocks(
+fn add_chroma_residual_blocks(
     params: &ReconParams,
     blocks: &[crate::residual::ResidualBlock],
     coded_halves: [bool; 2],
@@ -1203,7 +1085,7 @@ fn write_chroma_residual_blocks(
     yc: usize,
     n_tbs_c: usize,
     ccp: Option<CcpInput<'_>>,
-    plane: &mut CuResidualPlane,
+    pic: &mut Picture,
 ) -> Result<(), ReconError> {
     // §7.3.8.10 codes the halves upper-then-lower, each gated on its
     // own cbf. The stacked pair exists ONLY for ChromaArrayType == 2
@@ -1243,7 +1125,7 @@ fn write_chroma_residual_blocks(
             );
         }
         let by = if v == 1 { yc + n } else { yc };
-        plane.write_block(xc, by, n, &res);
+        add_block(pic, cidx, (xc, by), n, &res);
     }
     Ok(())
 }
@@ -1635,6 +1517,8 @@ impl ReconCtx {
         let qp_y = (q.cur_pred + q.cur_delta + 52 + 2 * q.qp_bd_offset_y).rem_euclid(modulus)
             - q.qp_bd_offset_y;
         // Stamp the CU area for later qPY_A / qPY_B reads + deblocking.
+        // Every bound is a multiple of 4 and inside the stored cell
+        // rectangle, so each covered cell row is one contiguous span.
         let n = 1usize << log2_cb_size;
         let y_end = (y_cb + n)
             .min(q.h_cells * 4)
@@ -1642,11 +1526,15 @@ impl ReconCtx {
         let x_end = (x_cb + n)
             .min(q.w_cells * 4)
             .min((q.origin_cells_x + q.cols_cells) * 4);
-        for y in (y_cb.max(q.origin_cells * 4)..y_end).step_by(4) {
-            for x in (x_cb.max(q.origin_cells_x * 4)..x_end).step_by(4) {
-                if let Some(idx) = q.cell(x, y) {
-                    q.map[idx] = qp_y as i8;
-                }
+        let (y0, x0) = (y_cb.max(q.origin_cells * 4), x_cb.max(q.origin_cells_x * 4));
+        if x0 < x_end {
+            let (bx0, bx1) = (
+                (x0 >> 2) - q.origin_cells_x,
+                (x_end >> 2) - q.origin_cells_x,
+            );
+            for by in (y0 >> 2)..(y_end >> 2) {
+                let row = (by - q.origin_cells) * q.cols_cells;
+                q.map[row + bx0..row + bx1].fill(qp_y as i8);
             }
         }
         q.last_cu_qp = Some(qp_y);
@@ -3717,6 +3605,39 @@ mod tests {
         }
     }
 
+    /// The residual [`add_cu_residual`] adds for the `n × n`
+    /// transquant-bypass coding unit at the origin (QpY 25), per plane
+    /// (`[luma, cb, cr]`, row-major): the sample change over a mid-grey
+    /// prediction.
+    fn inter_cu_residual(params: &ReconParams, tree: &TransformTree, n: usize) -> [Vec<i32>; 3] {
+        let mut pic = Picture::new(
+            n,
+            n,
+            params.chroma_array_type,
+            params.bit_depth_luma,
+            params.bit_depth_chroma,
+        );
+        let planes = [Plane::Luma, Plane::Cb, Plane::Cr];
+        for p in planes {
+            let mid = 1i32 << (pic.bit_depth(p) - 1);
+            let (w, h) = pic.plane_dims(p);
+            for y in 0..h {
+                for x in 0..w {
+                    pic.set_sample(p, x, y, mid);
+                }
+            }
+        }
+        add_cu_residual(&mut pic, params, tree, 0, 0, n.trailing_zeros(), 25, true).unwrap();
+        planes.map(|p| {
+            let mid = 1i32 << (pic.bit_depth(p) - 1);
+            let (w, h) = pic.plane_dims(p);
+            (0..h)
+                .flat_map(|y| (0..w).map(move |x| (x, y)))
+                .map(|(x, y)| pic.sample(p, x, y) - mid)
+                .collect()
+        })
+    }
+
     /// A §7.4.9.12 `cross_comp_pred()` result with the given
     /// `ResScaleVal` (a signed power of two in −8..=8).
     fn ccp(res_scale_val: i32) -> crate::binarization::CrossCompPred {
@@ -3839,11 +3760,11 @@ mod tests {
         assert_eq!(r, vec![-48, 48]);
     }
 
-    /// §8.5.4.3 step 5 in the inter residual-extraction path: a
-    /// cbf-clear Cb block still receives the scaled luma residual, and
-    /// a coded Cr block is modified after its own inverse transform.
+    /// §8.5.4.3 step 5 in the inter residual path: a cbf-clear Cb block
+    /// still receives the scaled luma residual, and a coded Cr block is
+    /// modified after its own inverse transform.
     #[test]
-    fn ccp_inter_extract_modifies_chroma_planes() {
+    fn ccp_inter_residual_modifies_chroma() {
         let params = params_444();
         let raw = |levels: Vec<i32>| ResidualBlock {
             log2_trafo_size: 3,
@@ -3866,20 +3787,12 @@ mod tests {
             cbf_luma: true,
             unit,
         };
-        let res = extract_cu_residual(&params, Some(&tree), 0, 0, 8, 25, true).unwrap();
-        assert!(res.luma.samples.iter().all(|&v| v == 16), "luma");
+        let [luma, cb, cr] = inter_cu_residual(&params, &tree, 8);
+        assert!(luma.iter().all(|&v| v == 16), "luma");
         // Cb (uncoded): (2·16) >> 3 = 4.
-        assert!(
-            res.cb.as_ref().unwrap().samples.iter().all(|&v| v == 4),
-            "cb: {:?}",
-            &res.cb.as_ref().unwrap().samples[..8]
-        );
+        assert!(cb.iter().all(|&v| v == 4), "cb: {:?}", &cb[..8]);
         // Cr (coded 5): 5 + ((−4·16) >> 3) = −3.
-        assert!(
-            res.cr.as_ref().unwrap().samples.iter().all(|&v| v == -3),
-            "cr: {:?}",
-            &res.cr.as_ref().unwrap().samples[..8]
-        );
+        assert!(cr.iter().all(|&v| v == -3), "cr: {:?}", &cr[..8]);
     }
 
     /// §8.5.4.3: the stacked upper/lower chroma-block pair exists only
@@ -3924,12 +3837,11 @@ mod tests {
             cbf_cr_lower: false,
             children: Box::new([ccp_leaf, empty_leaf(), empty_leaf(), empty_leaf()]),
         };
-        let res = extract_cu_residual(&params, Some(&tree), 0, 0, 16, 25, true).unwrap();
-        let cb = res.cb.as_ref().unwrap();
+        let [_, cb, _] = inter_cu_residual(&params, &tree, 16);
         for y in 0..16 {
             for x in 0..16 {
                 let expected = if x < 8 && y < 8 { 4 } else { 0 };
-                assert_eq!(cb.samples[y * 16 + x], expected, "cb residual at ({x},{y})");
+                assert_eq!(cb[y * 16 + x], expected, "cb residual at ({x},{y})");
             }
         }
     }
@@ -4057,11 +3969,11 @@ mod tests {
         }
     }
 
-    /// §8.5.4.1 step 4 in the inter residual-extraction path: the same
-    /// (4, 3, 14) → (6, −4, 10) lifting lands in the CU residual
-    /// planes.
+    /// §8.5.4.1 step 4 in the inter residual path: the same
+    /// (4, 3, 14) → (6, −4, 10) lifting is added onto the inter
+    /// prediction.
     #[test]
-    fn act_inter_extract_lifts_residual_triple() {
+    fn act_inter_residual_lifts_triple() {
         let params = params_444();
         let raw = |levels: Vec<i32>| ResidualBlock {
             log2_trafo_size: 3,
@@ -4085,16 +3997,10 @@ mod tests {
             cbf_luma: true,
             unit,
         };
-        let res = extract_cu_residual(&params, Some(&tree), 0, 0, 8, 25, true).unwrap();
-        assert!(res.luma.samples.iter().all(|&v| v == 6), "luma");
-        assert!(
-            res.cb.as_ref().unwrap().samples.iter().all(|&v| v == -4),
-            "cb"
-        );
-        assert!(
-            res.cr.as_ref().unwrap().samples.iter().all(|&v| v == 10),
-            "cr"
-        );
+        let [luma, cb, cr] = inter_cu_residual(&params, &tree, 8);
+        assert!(luma.iter().all(|&v| v == 6), "luma");
+        assert!(cb.iter().all(|&v| v == -4), "cb");
+        assert!(cr.iter().all(|&v| v == 10), "cr");
     }
 
     /// §8.4.4.1 step-8 ordering: cross-component prediction applies
@@ -4124,15 +4030,9 @@ mod tests {
             cbf_luma: true,
             unit,
         };
-        let res = extract_cu_residual(&params, Some(&tree), 0, 0, 8, 25, true).unwrap();
-        assert!(res.luma.samples.iter().all(|&v| v == 12), "luma");
-        assert!(
-            res.cb.as_ref().unwrap().samples.iter().all(|&v| v == 4),
-            "cb"
-        );
-        assert!(
-            res.cr.as_ref().unwrap().samples.iter().all(|&v| v == 4),
-            "cr"
-        );
+        let [luma, cb, cr] = inter_cu_residual(&params, &tree, 8);
+        assert!(luma.iter().all(|&v| v == 12), "luma");
+        assert!(cb.iter().all(|&v| v == 4), "cb");
+        assert!(cr.iter().all(|&v| v == 4), "cr");
     }
 }

@@ -15,10 +15,10 @@
 //!    candidate from the collocated picture's motion field
 //!    ([`crate::pu_mv::resolve_cu_motion`]).
 //! 2. §8.5.3.3 — for each PU, build the §8.5.3.3.2 reference planes from the
-//!    resolved `RefPicListX[ refIdxLX ]` pictures, interpolate + combine,
-//!    add the §8.6.2 residual sliced from the CU residual planes
-//!    ([`crate::recon::extract_cu_residual`]) and clip into the target
-//!    picture ([`crate::recon::reconstruct_inter_pu`]).
+//!    resolved `RefPicListX[ refIdxLX ]` pictures, interpolate + combine
+//!    into the target picture, then add the CU's §8.6.2 residual transform
+//!    block by transform block with the §8.6.7 clip
+//!    ([`reconstruct_inter_cu`]).
 //!
 //! Intra coding units inside a P / B slice are reconstructed by the §8.4
 //! intra path; the motion field records them as intra so a later inter CU's
@@ -29,10 +29,7 @@ use crate::inter_pred::{PuWeights, WpListWeights};
 use crate::motion::{derive_chroma_mv, MotionField};
 use crate::picture::{sub_wh_c, Picture, Plane};
 use crate::pu_mv::{resolve_cu_motion, InterCuDesc, PuMotion, PuMvContext, PuRect};
-use crate::recon::{
-    extract_cu_residual, reconstruct_inter_pu_weighted, CuResidual, ReconError, ReconParams,
-    ResolvedList,
-};
+use crate::recon::{add_cu_residual, predict_inter_pu_into, ReconError, ReconParams, ResolvedList};
 use crate::slice_data::{CodingUnit, PredictionUnit};
 
 /// The slice's §7.4.7.3-derived weighted-prediction tables, resolved
@@ -159,17 +156,19 @@ impl<'a> RefListAccess<'a> {
 ///
 /// `motions` are the §8.5.3.2.1-resolved per-PU motions (same order as the
 /// CU's §7.3.8.6 prediction units), already written into the picture's
-/// motion field by [`resolve_cu_motion`]. `residual` is the CU's
-/// per-component residual planes ([`extract_cu_residual`]). `refs` resolves
-/// each list's reference picture. Each PU's covering residual is sliced from
-/// the CU residual planes and added onto the motion-compensated prediction.
+/// motion field by [`resolve_cu_motion`]. `refs` resolves each list's
+/// reference picture. Every PU's motion-compensated prediction is written
+/// first; the CU's §8.6.2 residual — none when it codes no transform tree
+/// (skip / `rqt_root_cbf == 0`) — is then added onto it, `qp_y` being the
+/// CU's §8.6.1 `QpY`.
 ///
 /// `wp` carries the slice's §8.5.3.3.4.3 weighted-prediction tables when
 /// `weightedPredFlag == 1`; `None` selects the §8.5.3.3.4.2 default
 /// combine.
 ///
 /// # Errors
-/// Propagates [`ReconError`] from the §8.5.3.3 interpolation / combine.
+/// Propagates [`ReconError`] from the §8.5.3.3 interpolation / combine and
+/// the §8.6.2 inverse transform.
 #[allow(clippy::too_many_arguments)]
 pub fn reconstruct_inter_cu(
     pic: &mut Picture,
@@ -177,13 +176,10 @@ pub fn reconstruct_inter_cu(
     cu: &CodingUnit,
     rects: &[PuRect],
     motions: &[PuMotion],
-    residual: &CuResidual,
+    qp_y: i32,
     refs: &RefListAccess,
     wp: Option<&SliceWpTables>,
 ) -> Result<(), ReconError> {
-    let cat = params.chroma_array_type;
-    let (sub_w, sub_h) = if cat != 0 { sub_wh_c(cat) } else { (1, 1) };
-
     // §8.5.3.1: a prediction from the current picture (intra block
     // copy) reads the current decoded samples before in-loop
     // filtering. The §8.5.3.1 availability constraints guarantee every
@@ -221,42 +217,31 @@ pub fn reconstruct_inter_cu(
             motion.ref_idx_l1,
             motion.mv_l1,
         )?;
-
-        // Slice the PU's covering residual out of the CU residual planes.
-        let res_luma = residual
-            .luma
-            .slice_region(rect.x_pb, rect.y_pb, rect.n_pb_w, rect.n_pb_h);
-        let (res_cb, res_cr) = if cat != 0 {
-            let (cx, cy) = (rect.x_pb / sub_w, rect.y_pb / sub_h);
-            let (cw, ch) = (rect.n_pb_w / sub_w, rect.n_pb_h / sub_h);
-            (
-                residual.cb.as_ref().map(|p| p.slice_region(cx, cy, cw, ch)),
-                residual.cr.as_ref().map(|p| p.slice_region(cx, cy, cw, ch)),
-            )
-        } else {
-            (None, None)
-        };
-
         // §8.5.3.3.4.1 — resolve the PU's explicit weights from its
         // reference indices when the slice's weightedPredFlag is 1.
         let pu_weights = wp.map(|t| t.resolve_pu(motion));
-        reconstruct_inter_pu_weighted(
+        predict_inter_pu_into(
             pic,
             params,
-            rect.x_pb,
-            rect.y_pb,
-            rect.n_pb_w,
-            rect.n_pb_h,
+            (rect.x_pb, rect.y_pb, rect.n_pb_w, rect.n_pb_h),
             l0,
             l1,
-            Some(res_luma.as_slice()),
-            res_cb.as_deref(),
-            res_cr.as_deref(),
             pu_weights.as_ref(),
         )?;
     }
-    let _ = cu;
-    Ok(())
+    match &cu.transform_tree {
+        Some(tree) => add_cu_residual(
+            pic,
+            params,
+            tree,
+            cu.x0 as usize,
+            cu.y0 as usize,
+            cu.log2_cb_size,
+            qp_y,
+            cu.cu_transquant_bypass_flag,
+        ),
+        None => Ok(()),
+    }
 }
 
 /// Build a [`ResolvedList`] for one reference list, deriving the §8.5.3.2.10
@@ -321,14 +306,14 @@ where
 /// `field`, then reconstruct its samples into `pic`.
 ///
 /// This composes [`resolve_cu_motion`] (the candidate derivation reading the
-/// in-progress `field`) with [`extract_cu_residual`] + [`reconstruct_inter_cu`].
+/// in-progress `field`) with [`reconstruct_inter_cu`].
 /// `pus` are the parsed §7.3.8.6 prediction units; `ctx` carries the
 /// reference-picture resolvers + slice context; `available` is the §6.4.2
 /// prediction-block availability test; `wp` the slice's §8.5.3.3.4.3
 /// weighted-prediction tables (`None` for the default combine).
 ///
 /// # Errors
-/// Propagates [`ReconError`] from the residual extraction / reconstruction.
+/// Propagates [`ReconError`] from the reconstruction.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_and_reconstruct_inter_cu(
     pic: &mut Picture,
@@ -353,16 +338,6 @@ pub fn resolve_and_reconstruct_inter_cu(
     let rects =
         crate::pu_mv::pu_partitions(cu.x0 as usize, cu.y0 as usize, n_cb_s, cu.part_mode.into());
 
-    let residual = extract_cu_residual(
-        params,
-        cu.transform_tree.as_ref(),
-        cu.x0 as usize,
-        cu.y0 as usize,
-        n_cb_s,
-        qp_y,
-        cu.cu_transquant_bypass_flag,
-    )?;
-
     // §8.7.2.4 — mark the per-4×4 cells covered by a transform block with a
     // coded luma coefficient so the deblocking boundary-strength `cbf` test
     // (bS = 1 at a transform-block edge with a non-zero coefficient) reads
@@ -371,7 +346,7 @@ pub fn resolve_and_reconstruct_inter_cu(
         mark_nonzero_luma(field, tree, cu.x0 as usize, cu.y0 as usize, cu.log2_cb_size);
     }
 
-    reconstruct_inter_cu(pic, params, cu, &rects, &motions, &residual, refs, wp)
+    reconstruct_inter_cu(pic, params, cu, &rects, &motions, qp_y, refs, wp)
 }
 
 /// Walk an inter CU's transform tree and mark each leaf transform block that
@@ -700,6 +675,24 @@ impl<'a> PictureReconstructor<'a> {
             params.bit_depth_luma,
             params.bit_depth_chroma,
         );
+        let field = MotionField::new(pic_width_luma, pic_height_luma);
+        Self::with_buffers((pic, field), params, slice, tiles, refs, col_field)
+    }
+
+    /// [`Self::new`] over a supplied zeroed picture and all-intra motion
+    /// field of the picture's size (reused storage).
+    ///
+    /// # Errors
+    /// Propagates the [`crate::recon::ReconCtx`] construction error.
+    pub(crate) fn with_buffers(
+        (pic, field): (Picture, MotionField),
+        params: &'a ReconParams,
+        slice: &'a InterSliceContext,
+        tiles: &crate::availability::TilingParams,
+        refs: &'a RefListAccess<'a>,
+        col_field: Option<&'a MotionField>,
+    ) -> Result<Self, ReconError> {
+        let (pic_width_luma, pic_height_luma) = pic.plane_dims(Plane::Luma);
         let mut ctx = crate::recon::ReconCtx::new(
             pic_width_luma,
             pic_height_luma,
@@ -714,7 +707,6 @@ impl<'a> PictureReconstructor<'a> {
             6 * (i32::from(params.bit_depth_luma) - 8),
         );
         ctx.set_constrained_intra(slice.constrained_intra_pred);
-        let field = MotionField::new(pic_width_luma, pic_height_luma);
         let ctb_size = 1usize << slice.ctb_log2_size_y;
         let pic_w_ctbs = pic_width_luma.div_ceil(ctb_size);
         let pic_h_ctbs = pic_height_luma.div_ceil(ctb_size);

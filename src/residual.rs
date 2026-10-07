@@ -113,11 +113,11 @@ use crate::binarization::{
     last_sig_coeff_position, last_sig_coeff_prefix_cmax, last_sig_coeff_prefix_ctx_inc,
     last_sig_coeff_prefix_ctx_offset_shift, last_sig_coeff_suffix_n_bits,
     read_truncated_rice_prefix, sig_coeff_flag_ctx_inc_from_sig_ctx, sig_coeff_flag_sig_ctx_dc,
-    sig_coeff_flag_sig_ctx_general, sig_coeff_flag_sig_ctx_log2_2,
-    sig_coeff_flag_sig_ctx_transform_skip, signed_level_from_sign_flag, Greater1State,
+    sig_coeff_flag_sig_ctx_log2_2, sig_coeff_flag_sig_ctx_transform_skip,
+    signed_level_from_sign_flag, Greater1State,
 };
 use crate::cabac::{CabacEngine, CabacError, ContextModel};
-use crate::scan::{scan_order, ScanIdx, ScanOrderError};
+use crate::scan::{scan_order_table, scan_position_table, ScanIdx, ScanOrderError};
 
 // ---------------------------------------------------------------------
 // Context banks
@@ -655,35 +655,26 @@ pub fn decode_residual_coding_with<B: ResidualBinSource>(
 
     // §6.5 scan tables: the 4x4 in-sub-block scan and the sub-block
     // scan over the (1 << (log2 - 2))² grid.
-    let pos_scan = scan_order(2, params.scan_idx)?;
-    let sub_scan = scan_order((log2 - 2) as u8, params.scan_idx)?;
+    let pos_scan = scan_order_table(2, params.scan_idx)?;
+    let sub_scan = scan_order_table((log2 - 2) as u8, params.scan_idx)?;
     let num_sb_1d = 1usize << (log2 - 2);
     let size = 1usize << log2;
 
-    // §7.3.8.11 do-while: locate (lastSubBlock, lastScanPos) from the
-    // last-significant position. The decoded position is always
-    // inside the TB (the §9.3.4.2.3 cMax bounds the prefix), so the
-    // walk terminates.
-    let mut last_scan_pos: i32 = 16;
-    let mut last_sub_block: i32 = (num_sb_1d * num_sb_1d) as i32 - 1;
-    loop {
-        if last_scan_pos == 0 {
-            last_scan_pos = 16;
-            last_sub_block -= 1;
-        }
-        last_scan_pos -= 1;
-        debug_assert!(last_sub_block >= 0, "last-sig position outside the TB");
-        let sb = sub_scan[last_sub_block as usize];
-        let xc = (u32::from(sb.x) << 2) + u32::from(pos_scan[last_scan_pos as usize].x);
-        let yc = (u32::from(sb.y) << 2) + u32::from(pos_scan[last_scan_pos as usize].y);
-        if xc == last_x && yc == last_y {
-            break;
-        }
-    }
+    // §7.3.8.11 do-while: (lastSubBlock, lastScanPos) are the scan
+    // positions of the last-significant coefficient's sub-block and of
+    // its cell inside that sub-block. The decoded position is always
+    // inside the TB (the §9.3.4.2.3 cMax bounds the prefix).
+    let (lx, ly) = (last_x as usize, last_y as usize);
+    assert!(lx < size && ly < size, "last-sig position outside the TB");
+    let sub_position = scan_position_table((log2 - 2) as u8, params.scan_idx)?;
+    let cell_position = scan_position_table(2, params.scan_idx)?;
+    let last_sub_block = i32::from(sub_position[(ly >> 2) * num_sb_1d + (lx >> 2)]);
+    let last_scan_pos = i32::from(cell_position[(ly & 3) * 4 + (lx & 3)]);
 
     let mut levels = vec![0i32; size * size];
-    // coded_sub_block_flag[ xS ][ yS ] grid, row-major by yS.
-    let mut csbf = vec![0u8; num_sb_1d * num_sb_1d];
+    // coded_sub_block_flag[ xS ][ yS ] grid, row-major by yS (at most
+    // 8 × 8 sub-blocks for a 32 × 32 TB).
+    let mut csbf = [0u8; 64];
     let csbf_at = |grid: &[u8], xs: usize, ys: usize| -> u8 {
         if xs < num_sb_1d && ys < num_sb_1d {
             grid[ys * num_sb_1d + xs]
@@ -730,32 +721,34 @@ pub fn decode_residual_coding_with<B: ResidualBinSource>(
             // definition (§7.4.9.11 first inference bullet).
             sig[last_scan_pos as usize] = 1;
         }
+        // §9.3.4.2.5 fourth branch: prevCsbf and the tail offset are
+        // constant across the sub-block.
+        let general = SigCtxGeneral::new(
+            is_chroma,
+            log2,
+            (xs, ys),
+            (
+                csbf_at(&csbf, xs as usize + 1, ys as usize),
+                csbf_at(&csbf, xs as usize, ys as usize + 1),
+            ),
+            scan_idx_num,
+        );
         let start_n: i32 = if is_last_sb { last_scan_pos - 1 } else { 15 };
         for n in (0..=start_n).rev() {
-            let xc = (xs << 2) + u32::from(pos_scan[n as usize].x);
-            let yc = (ys << 2) + u32::from(pos_scan[n as usize].y);
+            let (xp, yp) = (
+                u32::from(pos_scan[n as usize].x),
+                u32::from(pos_scan[n as usize].y),
+            );
             if sb_coded == 1 && (n > 0 || !infer_sb_dc_sig) {
                 // §9.3.4.2.5 sigCtx branch dispatch.
                 let sig_ctx = if params.transform_skip_sig_ctx {
                     sig_coeff_flag_sig_ctx_transform_skip(is_chroma)
                 } else if log2 == 2 {
-                    sig_coeff_flag_sig_ctx_log2_2(xc & 3, yc & 3)
-                } else if xc + yc == 0 {
+                    sig_coeff_flag_sig_ctx_log2_2(xp, yp)
+                } else if xs + ys + xp + yp == 0 {
                     sig_coeff_flag_sig_ctx_dc(is_chroma, log2, scan_idx_num)
                 } else {
-                    let right = csbf_at(&csbf, xs as usize + 1, ys as usize);
-                    let below = csbf_at(&csbf, xs as usize, ys as usize + 1);
-                    sig_coeff_flag_sig_ctx_general(
-                        is_chroma,
-                        log2,
-                        xc,
-                        yc,
-                        xs,
-                        ys,
-                        right,
-                        below,
-                        scan_idx_num,
-                    )
+                    general.sig_ctx(xp, yp)
                 };
                 let ctx_inc = sig_coeff_flag_ctx_inc_from_sig_ctx(sig_ctx, is_chroma);
                 let bin = bins.decision(ResidualElement::SigCoeffFlag, ctx_inc)?;
@@ -971,6 +964,76 @@ pub fn decode_residual_coding_with<B: ResidualBinSource>(
     })
 }
 
+/// The §9.3.4.2.5 fourth-branch sigCtx (equations 9-43 .. 9-53, the
+/// [`crate::binarization::sig_coeff_flag_sig_ctx_general`] derivation) of
+/// one sub-block, its `prevCsbf` pattern and tail offset resolved once.
+struct SigCtxGeneral {
+    /// Equations 9-45 .. 9-48 by in-sub-block position `( yP << 2 ) +
+    /// xP`.
+    pattern: &'static [u8; 16],
+    /// Equations 9-49 .. 9-53.
+    tail: u32,
+}
+
+impl SigCtxGeneral {
+    /// The equations 9-45 .. 9-48 patterns, indexed by `prevCsbf`.
+    const PATTERNS: [[u8; 16]; 4] = [
+        // 9-45: ( xP + yP == 0 ) ? 2 : ( xP + yP < 3 ) ? 1 : 0.
+        [2, 1, 1, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+        // 9-46: ( yP == 0 ) ? 2 : ( yP == 1 ) ? 1 : 0.
+        [2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+        // 9-47: ( xP == 0 ) ? 2 : ( xP == 1 ) ? 1 : 0.
+        [2, 1, 0, 0, 2, 1, 0, 0, 2, 1, 0, 0, 2, 1, 0, 0],
+        // 9-48: 2.
+        [2; 16],
+    ];
+
+    /// `right` / `below` are `coded_sub_block_flag[ xS + 1 ][ yS ]` /
+    /// `[ xS ][ yS + 1 ]` (0 past the TB, and gated off at its edge by
+    /// equations 9-43 / 9-44).
+    fn new(
+        is_chroma: bool,
+        log2_trafo_size: u32,
+        (xs, ys): (u32, u32),
+        (right, below): (u8, u8),
+        scan_idx: u32,
+    ) -> Self {
+        let max_sub_block = (1u32 << log2_trafo_size.saturating_sub(2)) - 1;
+        let prev_csbf = usize::from(xs < max_sub_block && right & 1 != 0)
+            | (usize::from(ys < max_sub_block && below & 1 != 0) << 1);
+        let tail = if is_chroma {
+            if log2_trafo_size == 3 {
+                9
+            } else {
+                12
+            }
+        } else {
+            let first = if xs + ys > 0 { 3 } else { 0 };
+            first
+                + if log2_trafo_size == 3 {
+                    if scan_idx == 0 {
+                        9
+                    } else {
+                        15
+                    }
+                } else {
+                    21
+                }
+        };
+        Self {
+            pattern: &Self::PATTERNS[prev_csbf],
+            tail,
+        }
+    }
+
+    /// sigCtx at in-sub-block position `( xP, yP )` (not the DC position
+    /// of the TB, which takes equation 9-42).
+    #[inline]
+    fn sig_ctx(&self, xp: u32, yp: u32) -> u32 {
+        u32::from(self.pattern[((yp << 2) | xp) as usize & 15]) + self.tail
+    }
+}
+
 /// §7.3.8.11 — engine-backed entry point: binds `engine` + `contexts`
 /// into an [`EngineResidualBinSource`] and runs
 /// [`decode_residual_coding_with`].
@@ -1135,7 +1198,7 @@ mod tests {
             ]
         );
         // The 15 sig bins route through the Table 9-50 map (eq. 9-41).
-        let pos_scan = scan_order(2, ScanIdx::Diagonal).unwrap();
+        let pos_scan = scan_order_table(2, ScanIdx::Diagonal).unwrap();
         for (k, n) in (0..=14).rev().enumerate() {
             let (element, ctx_inc) = bins.log[6 + k];
             assert_eq!(element, ResidualElement::SigCoeffFlag);
@@ -1311,7 +1374,7 @@ mod tests {
         ];
         let mut bins = Scripted::new(&decisions, &bypasses);
         let block = decode_residual_coding_with(&params, &mut bins).unwrap();
-        let pos_scan = scan_order(2, ScanIdx::Diagonal).unwrap();
+        let pos_scan = scan_order_table(2, ScanIdx::Diagonal).unwrap();
         assert_eq!(block.level(3, 3), 13, "baseLevel 3 + remaining 10");
         let p14 = pos_scan[14];
         assert_eq!(
@@ -1584,5 +1647,45 @@ mod tests {
         assert_ne!(ResidualContexts::init(0, 26), ResidualContexts::init(1, 26));
         assert_ne!(ResidualContexts::init(1, 26), ResidualContexts::init(2, 26));
         assert_ne!(ResidualContexts::init(0, 26), ResidualContexts::init(2, 26));
+    }
+
+    /// The per-sub-block sigCtx equals the §9.3.4.2.5 general derivation
+    /// for every colour, size, scan, sub-block, neighbour flag pair and
+    /// in-sub-block position (except the TB's DC position).
+    #[test]
+    fn sub_block_sig_ctx_matches_general_derivation() {
+        use crate::binarization::sig_coeff_flag_sig_ctx_general;
+        for is_chroma in [false, true] {
+            for log2 in 3..=5u32 {
+                let num_sb = 1u32 << (log2 - 2);
+                for scan_idx in 0..=2u32 {
+                    for (xs, ys) in (0..num_sb).flat_map(|y| (0..num_sb).map(move |x| (x, y))) {
+                        for (right, below) in [(0u8, 0u8), (1, 0), (0, 1), (1, 1)] {
+                            let fast = SigCtxGeneral::new(
+                                is_chroma,
+                                log2,
+                                (xs, ys),
+                                (right, below),
+                                scan_idx,
+                            );
+                            for (xp, yp) in (0..4).flat_map(|y| (0..4).map(move |x| (x, y))) {
+                                let (xc, yc) = ((xs << 2) + xp, (ys << 2) + yp);
+                                if xc + yc == 0 {
+                                    continue;
+                                }
+                                assert_eq!(
+                                    fast.sig_ctx(xp, yp),
+                                    sig_coeff_flag_sig_ctx_general(
+                                        is_chroma, log2, xc, yc, xs, ys, right, below, scan_idx
+                                    ),
+                                    "chroma {is_chroma} log2 {log2} scan {scan_idx} sb ({xs}, {ys}) \
+                                     csbf ({right}, {below}) at ({xp}, {yp})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

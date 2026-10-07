@@ -13,6 +13,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   every inter CU. Completed inter CUs stamp that grid; intra stamps, WPP
   halos, tile bands, slice/z-order gates and the current-CU inter override
   are preserved. No extra picture-sized storage or decoder API change.
+- Single-thread decoding of inter-heavy 1080p streams takes about 4×
+  fewer CPU cycles with unchanged output (120-frame 1080p Main / Main10
+  clips on an M1 Pro: 30.5G → ~7.0G and 34.0G → ~7.8G cycles). Inter
+  prediction is written straight into the picture and each coding unit's
+  residual is added per transform block; picture, motion-field and
+  output-plane buffers are recycled; interpolation, the inverse transform
+  (vectorizable flat scaling over the non-zero extent, a four-column
+  column pass), residual significance contexts, SAO, deblocking edge
+  derivation, CABAC bit reads and 10-bit output packing were
+  restructured. Every output plane of the 188 FATE conformance streams,
+  serial and two-thread, is byte-identical to the previous decoder,
+  including the errors reported on malformed streams. The internal
+  `recon::extract_cu_residual` / `CuResidual` / `CuResidualPlane` are
+  gone.
 
 ### Added
 

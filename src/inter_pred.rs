@@ -43,6 +43,8 @@
 //! a `(xInt, yInt, xFrac, yFrac)` location and a reference plane, and
 //! stops at the prediction sample arrays.
 
+use std::cell::RefCell;
+
 /// A reference-picture luma / chroma sample plane with the §8.5.3.3.3
 /// `Clip3( 0, dim − 1, … )` edge-extension border (equations 8-222 /
 /// 8-223 for luma, 8-239 / 8-240 for chroma).
@@ -196,69 +198,37 @@ fn interp_shift3(bit_depth: u8) -> i32 {
 /// sample untouched on the horizontal pass); rows 1/2/3 are the `a`/`b`/`c`
 /// kernels of equations 8-224 / 8-225 / 8-226, each over the eight taps
 /// `A[−3..4]`.
-const LUMA_FILTER: [[i32; 8]; 4] = [
+const LUMA_FILTER: [[i16; 8]; 4] = [
     [0, 0, 0, 64, 0, 0, 0, 0],
     [-1, 4, -10, 58, 17, -5, 1, 0],
     [-1, 4, -11, 40, 40, -11, 4, -1],
     [0, 1, -5, 17, 58, -10, 4, -1],
 ];
 
-/// One separable 8-tap luma sample at fractional offset `( x_frac, y_frac )`,
-/// centred on integer location `( x_int, y_int )` (§8.5.3.3.3.2).
-///
-/// Returns the intermediate sample value (`>> shift1` / `>> shift2`, or
-/// `A << shift3` for the full-pel `( 0, 0 )` corner) at the
-/// `14 − BitDepthY`-bit internal precision — not yet clipped.
-#[inline]
-fn interp_luma_sample(
-    plane: &RefPlane<'_>,
-    x_int: i32,
-    y_int: i32,
+/// Validates one block interpolation's inputs in the order the
+/// public interpolation functions report them: block dimensions,
+/// horizontal / vertical phase (`0..=max_frac`), then bit depth.
+fn check_interp(
+    w: usize,
+    h: usize,
     x_frac: i32,
     y_frac: i32,
+    max_frac: i32,
     bit_depth: u8,
-) -> i32 {
-    let shift1 = interp_shift1(bit_depth);
-    let shift3 = interp_shift3(bit_depth);
-
-    // Full-pel: A << shift3 (Table 8-8, xFracL == yFracL == 0).
-    if x_frac == 0 && y_frac == 0 {
-        return plane.at(x_int, y_int) << shift3;
+) -> Result<(), InterPredError> {
+    if w == 0 || h == 0 {
+        return Err(InterPredError::EmptyBlock);
     }
-
-    let hk = &LUMA_FILTER[x_frac as usize];
-    let vk = &LUMA_FILTER[y_frac as usize];
-
-    if y_frac == 0 {
-        // Horizontal-only (a / b / c): >> shift1.
-        let mut acc = 0i32;
-        for (t, &c) in hk.iter().enumerate() {
-            acc += c * plane.at(x_int - 3 + t as i32, y_int);
-        }
-        return acc >> shift1;
+    if !(0..=max_frac).contains(&x_frac) {
+        return Err(InterPredError::InvalidFraction(x_frac));
     }
-
-    if x_frac == 0 {
-        // Vertical-only (d / h / n): >> shift1.
-        let mut acc = 0i32;
-        for (t, &c) in vk.iter().enumerate() {
-            acc += c * plane.at(x_int, y_int - 3 + t as i32);
-        }
-        return acc >> shift1;
+    if !(0..=max_frac).contains(&y_frac) {
+        return Err(InterPredError::InvalidFraction(y_frac));
     }
-
-    // Two-dimensional (e/i/p, f/j/q, g/k/r): horizontal pass at >> shift1
-    // over rows j = −3..4, then a vertical pass at >> shift2 = 6.
-    let mut acc = 0i32;
-    for (vt, &cv) in vk.iter().enumerate() {
-        let row = y_int - 3 + vt as i32;
-        let mut h = 0i32;
-        for (ht, &ch) in hk.iter().enumerate() {
-            h += ch * plane.at(x_int - 3 + ht as i32, row);
-        }
-        acc += cv * (h >> shift1);
+    if !(8..=16).contains(&bit_depth) {
+        return Err(InterPredError::InvalidBitDepth(bit_depth));
     }
-    acc >> 6
+    Ok(())
 }
 
 /// §8.5.3.3.3.2 — fill an `(nPbW)x(nPbH)` luma prediction block.
@@ -268,7 +238,10 @@ fn interp_luma_sample(
 /// per equations 8-214 / 8-215) and `( x_frac, y_frac )` the
 /// quarter-pel remainder (`mvLX[..] & 3`, equations 8-216 / 8-217). The
 /// output is row-major, `predSamples[ y * nPbW + x ]`, holding the
-/// intermediate-precision values §8.5.3.3.4 consumes.
+/// intermediate-precision values §8.5.3.3.4 consumes: `A << shift3` for
+/// the full-sample phase, `>> shift1` for the one-dimensional phases,
+/// and `>> shift1` horizontally then `>> 6` vertically for the
+/// two-dimensional ones.
 ///
 /// # Errors
 ///
@@ -288,26 +261,22 @@ pub fn interp_luma_block(
     n_pb_h: usize,
     bit_depth: u8,
 ) -> Result<Vec<i32>, InterPredError> {
-    if n_pb_w == 0 || n_pb_h == 0 {
-        return Err(InterPredError::EmptyBlock);
-    }
-    if !(0..=3).contains(&x_frac) {
-        return Err(InterPredError::InvalidFraction(x_frac));
-    }
-    if !(0..=3).contains(&y_frac) {
-        return Err(InterPredError::InvalidFraction(y_frac));
-    }
-    if !(8..=16).contains(&bit_depth) {
-        return Err(InterPredError::InvalidBitDepth(bit_depth));
-    }
-
+    check_interp(n_pb_w, n_pb_h, x_frac, y_frac, 3, bit_depth)?;
     let mut out = vec![0i32; n_pb_w * n_pb_h];
-    for yl in 0..n_pb_h as i32 {
-        for xl in 0..n_pb_w as i32 {
-            out[(yl as usize) * n_pb_w + xl as usize] =
-                interp_luma_sample(plane, x_int + xl, y_int + yl, x_frac, y_frac, bit_depth);
-        }
-    }
+    with_scratch(|s| {
+        let kernel = |f: i32| (f != 0).then(|| &LUMA_FILTER[f as usize]);
+        interp_into(
+            plane,
+            x_int,
+            y_int,
+            kernel(x_frac),
+            kernel(y_frac),
+            n_pb_w,
+            bit_depth,
+            &mut s.work.interp,
+            &mut out,
+        );
+    });
     Ok(out)
 }
 
@@ -320,7 +289,7 @@ pub fn interp_luma_block(
 /// Row 0 (phase 0) is the identity; rows 1..7 are the `ab`/`ac`/`ad`/`ae`/
 /// `af`/`ag`/`ah` kernels of equations 8-241..8-247, each over the four
 /// taps `B[−1..2]`.
-const CHROMA_FILTER: [[i32; 4]; 8] = [
+const CHROMA_FILTER: [[i16; 4]; 8] = [
     [0, 64, 0, 0],
     [-2, 58, 10, -2],
     [-4, 54, 16, -2],
@@ -331,67 +300,14 @@ const CHROMA_FILTER: [[i32; 4]; 8] = [
     [-2, 10, 58, -2],
 ];
 
-/// One separable 4-tap chroma sample at eighth-pel offset
-/// `( x_frac, y_frac )`, centred on integer location `( x_int, y_int )`
-/// (§8.5.3.3.3.3). Returns the intermediate-precision value (not clipped).
-#[inline]
-fn interp_chroma_sample(
-    plane: &RefPlane<'_>,
-    x_int: i32,
-    y_int: i32,
-    x_frac: i32,
-    y_frac: i32,
-    bit_depth: u8,
-) -> i32 {
-    let shift1 = interp_shift1(bit_depth);
-    let shift3 = interp_shift3(bit_depth);
-
-    if x_frac == 0 && y_frac == 0 {
-        return plane.at(x_int, y_int) << shift3;
-    }
-
-    let hk = &CHROMA_FILTER[x_frac as usize];
-    let vk = &CHROMA_FILTER[y_frac as usize];
-
-    if y_frac == 0 {
-        // Horizontal-only (aX, equations 8-241..8-247): >> shift1.
-        let mut acc = 0i32;
-        for (t, &c) in hk.iter().enumerate() {
-            acc += c * plane.at(x_int - 1 + t as i32, y_int);
-        }
-        return acc >> shift1;
-    }
-
-    if x_frac == 0 {
-        // Vertical-only (Xa, equations 8-248..8-254): >> shift1.
-        let mut acc = 0i32;
-        for (t, &c) in vk.iter().enumerate() {
-            acc += c * plane.at(x_int, y_int - 1 + t as i32);
-        }
-        return acc >> shift1;
-    }
-
-    // Two-dimensional (XY, equations 8-255..8-261): horizontal pass at
-    // >> shift1 over rows i = −1..2, then a vertical pass at >> shift2 = 6.
-    let mut acc = 0i32;
-    for (vt, &cv) in vk.iter().enumerate() {
-        let row = y_int - 1 + vt as i32;
-        let mut h = 0i32;
-        for (ht, &ch) in hk.iter().enumerate() {
-            h += ch * plane.at(x_int - 1 + ht as i32, row);
-        }
-        acc += cv * (h >> shift1);
-    }
-    acc >> 6
-}
-
 /// §8.5.3.3.3.3 — fill an `(nPbW / SubWidthC)x(nPbH / SubHeightC)` chroma
 /// prediction block.
 ///
 /// `( x_int, y_int )` is the integer chroma location and
 /// `( x_frac, y_frac )` the eighth-pel remainder (`mvCLX[..] & 7`,
 /// equations 8-220 / 8-221). `block_w` / `block_h` are the chroma block
-/// dimensions. Output is row-major intermediate-precision values.
+/// dimensions. Output is row-major intermediate-precision values, with
+/// the same per-phase shifts as [`interp_luma_block`].
 ///
 /// # Errors
 ///
@@ -411,27 +327,255 @@ pub fn interp_chroma_block(
     block_h: usize,
     bit_depth: u8,
 ) -> Result<Vec<i32>, InterPredError> {
-    if block_w == 0 || block_h == 0 {
-        return Err(InterPredError::EmptyBlock);
-    }
-    if !(0..=7).contains(&x_frac) {
-        return Err(InterPredError::InvalidFraction(x_frac));
-    }
-    if !(0..=7).contains(&y_frac) {
-        return Err(InterPredError::InvalidFraction(y_frac));
-    }
-    if !(8..=16).contains(&bit_depth) {
-        return Err(InterPredError::InvalidBitDepth(bit_depth));
-    }
-
+    check_interp(block_w, block_h, x_frac, y_frac, 7, bit_depth)?;
     let mut out = vec![0i32; block_w * block_h];
-    for yc in 0..block_h as i32 {
-        for xc in 0..block_w as i32 {
-            out[(yc as usize) * block_w + xc as usize] =
-                interp_chroma_sample(plane, x_int + xc, y_int + yc, x_frac, y_frac, bit_depth);
+    with_scratch(|s| {
+        let kernel = |f: i32| (f != 0).then(|| &CHROMA_FILTER[f as usize]);
+        interp_into(
+            plane,
+            x_int,
+            y_int,
+            kernel(x_frac),
+            kernel(y_frac),
+            block_w,
+            bit_depth,
+            &mut s.work.interp,
+            &mut out,
+        );
+    });
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Separable block filtering shared by §8.5.3.3.3.2 and §8.5.3.3.3.3
+// ---------------------------------------------------------------------------
+
+/// Reusable buffers for one block interpolation: the edge-extended
+/// source window and the horizontally filtered rows of the
+/// two-dimensional phases (`i16` when they fit, else `i32`).
+#[derive(Default)]
+struct InterpScratch {
+    window: Vec<u16>,
+    rows: Vec<i32>,
+    rows16: Vec<i16>,
+}
+
+/// Copies the `ww × wh` source window whose top-left plane location is
+/// `( x0, y0 )` into `window`, row-major, applying the §8.5.3.3.3
+/// `Clip3( 0, dim − 1, … )` edge extension to each coordinate that
+/// leaves the plane (the values [`RefPlane::at`] returns).
+fn gather_window(
+    plane: &RefPlane<'_>,
+    x0: i64,
+    y0: i64,
+    ww: usize,
+    wh: usize,
+    window: &mut Vec<u16>,
+) {
+    window.clear();
+    let (pw, ph) = (plane.width as i64, plane.height as i64);
+    let inside = x0 >= 0 && x0 + ww as i64 <= pw;
+    for r in 0..wh as i64 {
+        let y = (y0 + r).clamp(0, ph - 1) as usize;
+        let row = &plane.samples[y * plane.width..(y + 1) * plane.width];
+        if inside {
+            let x = x0 as usize;
+            window.extend_from_slice(&row[x..x + ww]);
+        } else {
+            window.extend((0..ww as i64).map(|k| row[(x0 + k).clamp(0, pw - 1) as usize]));
         }
     }
-    Ok(out)
+}
+
+/// One separable filter pass over a block: `dst[ y·w + x ] = put( ( Σ_t
+/// k[ t ] · get( src[ y·src_stride + t·step + x ] ) ) >> shift )` for
+/// every `x < w` and row `y < dst.len() / w`. The horizontal pass is
+/// `step == 1` with `src` at the first tap sample; the vertical pass is
+/// `step == src_stride` with `src` at the first tap row.
+///
+/// Each tap's `w` inputs of a row are sliced once; the row is then
+/// computed eight outputs at a time with every tap accumulated in
+/// registers, then four, then one at a time.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn filter_block<S: Copy, D, A: FilterAcc, const TAPS: usize>(
+    src: &[S],
+    src_stride: usize,
+    step: usize,
+    k: &[i16; TAPS],
+    shift: u32,
+    w: usize,
+    dst: &mut [D],
+    get: impl Fn(S) -> A + Copy,
+    put: impl Fn(A) -> D + Copy,
+) {
+    let c = k.map(A::from);
+    for (y, out) in dst.chunks_exact_mut(w).enumerate() {
+        let taps: [&[S]; TAPS] = core::array::from_fn(|t| {
+            let o = y * src_stride + t * step;
+            &src[o..o + w]
+        });
+        let mut x = 0;
+        while x + 8 <= w {
+            filter_group::<S, D, A, TAPS, 8>(&taps, x, &c, shift, &mut out[x..x + 8], get, put);
+            x += 8;
+        }
+        if x + 4 <= w {
+            filter_group::<S, D, A, TAPS, 4>(&taps, x, &c, shift, &mut out[x..x + 4], get, put);
+            x += 4;
+        }
+        while x < w {
+            filter_group::<S, D, A, TAPS, 1>(&taps, x, &c, shift, &mut out[x..x + 1], get, put);
+            x += 1;
+        }
+    }
+}
+
+/// [`filter_block`]'s `L` outputs `out` from column `x` of each tap's
+/// row inputs `taps`.
+#[inline(always)]
+fn filter_group<S: Copy, D, A: FilterAcc, const TAPS: usize, const L: usize>(
+    taps: &[&[S]; TAPS],
+    x: usize,
+    c: &[A; TAPS],
+    shift: u32,
+    out: &mut [D],
+    get: impl Fn(S) -> A,
+    put: impl Fn(A) -> D,
+) {
+    let mut acc = [A::default(); L];
+    for (tap, &c) in taps.iter().zip(c) {
+        let s: &[S; L] = tap[x..x + L].try_into().unwrap();
+        for (a, &v) in acc.iter_mut().zip(s) {
+            *a = *a + c * get(v);
+        }
+    }
+    for (o, a) in out.iter_mut().zip(acc) {
+        *o = put(a >> shift);
+    }
+}
+
+/// The accumulator lanes of [`filter_block`]: `i32`, or `i16` where
+/// every partial tap sum provably fits it.
+trait FilterAcc:
+    Copy
+    + Default
+    + From<i16>
+    + core::ops::Add<Output = Self>
+    + core::ops::Mul<Output = Self>
+    + core::ops::Shr<u32, Output = Self>
+{
+}
+
+impl FilterAcc for i16 {}
+
+impl FilterAcc for i32 {}
+
+/// Separable §8.5.3.3.3.2 / §8.5.3.3.3.3 interpolation of a `w`-wide
+/// block into `out` (row-major; the height is `out.len() / w`).
+///
+/// `TAPS` is 8 for luma (taps `−3..4`) or 4 for chroma (taps `−1..2`);
+/// `hk` / `vk` are the kernels of a non-zero horizontal / vertical
+/// phase, `None` for phase 0. Every output equals the per-sample
+/// equation: `A << shift3` at the full-sample phase, the one-dimensional
+/// tap sum `>> shift1`, or the vertical sum of the `>> shift1`
+/// horizontal results `>> 6`. The two-dimensional case computes each
+/// horizontal result once per source row instead of once per output
+/// sample; integer sums are unchanged by that sharing. A source window
+/// inside the plane is read in place; one that leaves it is gathered
+/// with the edge extension first.
+///
+/// Up to 12-bit samples every multiplicand is exact in 16 bits: the
+/// samples, the taps, and each horizontal result `>> shift1` (whose
+/// magnitude stays below 88 · 2^8). Those cases multiply 16-bit values
+/// into 32-bit sums and keep the rows as `i16`.
+#[allow(clippy::too_many_arguments)]
+fn interp_into<const TAPS: usize>(
+    plane: &RefPlane<'_>,
+    x_int: i32,
+    y_int: i32,
+    hk: Option<&[i16; TAPS]>,
+    vk: Option<&[i16; TAPS]>,
+    w: usize,
+    bit_depth: u8,
+    scratch: &mut InterpScratch,
+    out: &mut [i32],
+) {
+    let h = out.len() / w;
+    let shift1 = interp_shift1(bit_depth);
+    let before = (TAPS / 2 - 1) as i64;
+    let (x0, ww) = match hk {
+        Some(_) => (i64::from(x_int) - before, w + TAPS - 1),
+        None => (i64::from(x_int), w),
+    };
+    let (y0, wh) = match vk {
+        Some(_) => (i64::from(y_int) - before, h + TAPS - 1),
+        None => (i64::from(y_int), h),
+    };
+    let (pw, ph) = (plane.width as i64, plane.height as i64);
+    let (src, stride): (&[u16], usize) =
+        if x0 >= 0 && y0 >= 0 && x0 + ww as i64 <= pw && y0 + wh as i64 <= ph {
+            let start = y0 as usize * plane.width + x0 as usize;
+            (&plane.samples[start..], plane.width)
+        } else {
+            gather_window(plane, x0, y0, ww, wh, &mut scratch.window);
+            (&scratch.window, ww)
+        };
+    // A sample of at most 15 bits is the same value as `i16`: up to
+    // 12-bit samples every multiplicand is an exact `i16` (the samples,
+    // the taps, each horizontal result `>> shift1`), multiplied into
+    // `i32` sums. 8-bit samples (`shift1 == 0`): with taps summing to 64
+    // from negative parts of at most 24, every partial horizontal or
+    // one-dimensional tap sum lies in [ −24 · 255, 88 · 255 ], exact in
+    // `i16` lanes.
+    let sample16 = |s: u16| i32::from(s as i16);
+    let sample32 = |s: u16| i32::from(s);
+    let byte16 = |s: u16| s as i16;
+    let same = |v: i32| v;
+    let same16 = |v: i16| v;
+    let shift1 = shift1 as u32;
+    match (hk, vk) {
+        (None, None) => {
+            let shift3 = interp_shift3(bit_depth);
+            for (y, dst) in out.chunks_exact_mut(w).enumerate() {
+                for (o, &a) in dst.iter_mut().zip(&src[y * stride..y * stride + w]) {
+                    *o = i32::from(a) << shift3;
+                }
+            }
+        }
+        (Some(k), None) | (None, Some(k)) => {
+            let step = if hk.is_some() { 1 } else { stride };
+            if bit_depth == 8 {
+                filter_block(src, stride, step, k, 0, w, out, byte16, i32::from);
+            } else if bit_depth <= 12 {
+                filter_block(src, stride, step, k, shift1, w, out, sample16, same);
+            } else {
+                filter_block(src, stride, step, k, shift1, w, out, sample32, same);
+            }
+        }
+        (Some(hk), Some(vk)) => {
+            let len = wh * w;
+            if bit_depth <= 12 {
+                if scratch.rows16.len() < len {
+                    scratch.rows16.resize(len, 0);
+                }
+                let rows = &mut scratch.rows16[..len];
+                if bit_depth == 8 {
+                    filter_block(src, stride, 1, hk, 0, w, rows, byte16, same16);
+                } else {
+                    filter_block(src, stride, 1, hk, shift1, w, rows, sample16, |v| v as i16);
+                }
+                filter_block(rows, w, w, vk, 6, w, out, i32::from, same);
+            } else {
+                if scratch.rows.len() < len {
+                    scratch.rows.resize(len, 0);
+                }
+                let rows = &mut scratch.rows[..len];
+                filter_block(src, stride, 1, hk, shift1, w, rows, sample32, same);
+                filter_block(rows, w, w, vk, 6, w, out, same, same);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -468,6 +612,36 @@ pub fn default_weighted_pred(
     n_pb_h: usize,
     bit_depth: u8,
 ) -> Result<Vec<i32>, InterPredError> {
+    check_combine(
+        pred_l0,
+        pred_l1,
+        pred_flag_l0,
+        pred_flag_l1,
+        n_pb_w,
+        n_pb_h,
+        bit_depth,
+    )?;
+    let pred = PlanePrediction {
+        p0: pred_flag_l0.then_some(pred_l0),
+        p1: pred_flag_l1.then_some(pred_l1),
+        width: n_pb_w,
+        height: n_pb_h,
+        combine: Combine::new(bit_depth, None),
+    };
+    Ok(pred.to_vec())
+}
+
+/// The [`default_weighted_pred`] / [`explicit_weighted_pred`] input
+/// checks, in their documented order.
+fn check_combine(
+    pred_l0: &[i32],
+    pred_l1: &[i32],
+    pred_flag_l0: bool,
+    pred_flag_l1: bool,
+    n_pb_w: usize,
+    n_pb_h: usize,
+    bit_depth: u8,
+) -> Result<(), InterPredError> {
     if n_pb_w == 0 || n_pb_h == 0 {
         return Err(InterPredError::EmptyBlock);
     }
@@ -475,48 +649,193 @@ pub fn default_weighted_pred(
         return Err(InterPredError::InvalidBitDepth(bit_depth));
     }
     let count = n_pb_w * n_pb_h;
-    if pred_flag_l0 && pred_l0.len() != count {
-        return Err(InterPredError::ArrayLengthMismatch {
-            expected: count,
-            got: pred_l0.len(),
-        });
+    for (flag, pred) in [(pred_flag_l0, pred_l0), (pred_flag_l1, pred_l1)] {
+        if flag && pred.len() != count {
+            return Err(InterPredError::ArrayLengthMismatch {
+                expected: count,
+                got: pred.len(),
+            });
+        }
     }
-    if pred_flag_l1 && pred_l1.len() != count {
-        return Err(InterPredError::ArrayLengthMismatch {
-            expected: count,
-            got: pred_l1.len(),
-        });
+    if !pred_flag_l0 && !pred_flag_l1 {
+        return Err(InterPredError::EmptyPlane);
+    }
+    Ok(())
+}
+
+/// The §8.5.3.3.4 weighted sample prediction constants of one plane.
+#[derive(Debug, Clone, Copy)]
+enum Combine {
+    /// §8.5.3.3.4.2: `shift1` / `offset1` for one list (equations 8-262 /
+    /// 8-263), `shift2` / `offset2` for both (equation 8-264).
+    Default {
+        shift1: i32,
+        offset1: i32,
+        shift2: i32,
+        offset2: i32,
+        max: i32,
+    },
+    /// §8.5.3.3.4.3 with `log2Wd` (equations 8-265 / 8-270) and the
+    /// already-scaled offsets.
+    Explicit {
+        log2_wd: i64,
+        w0: i64,
+        o0: i64,
+        w1: i64,
+        o1: i64,
+        max: i64,
+    },
+}
+
+impl Combine {
+    /// The default combine (`weights == None`) or the explicit one with
+    /// `(log2WeightDenom, w0, o0, w1, o1)`, at `bit_depth`.
+    fn new(bit_depth: u8, weights: Option<(u8, i32, i32, i32, i32)>) -> Self {
+        match weights {
+            None => {
+                let shift1 = core::cmp::max(2, 14 - i32::from(bit_depth));
+                let shift2 = core::cmp::max(3, 15 - i32::from(bit_depth));
+                Self::Default {
+                    shift1,
+                    offset1: 1 << (shift1 - 1),
+                    shift2,
+                    offset2: 1 << (shift2 - 1),
+                    max: (1 << bit_depth) - 1,
+                }
+            }
+            Some((log2_weight_denom, w0, o0, w1, o1)) => Self::Explicit {
+                log2_wd: i64::from(log2_weight_denom)
+                    + core::cmp::max(2, 14 - i64::from(bit_depth)),
+                w0: i64::from(w0),
+                o0: i64::from(o0),
+                w1: i64::from(w1),
+                o1: i64::from(o1),
+                max: (1i64 << bit_depth) - 1,
+            },
+        }
+    }
+}
+
+/// One plane of a PU's §8.5.3.3.4 weighted sample prediction: the used
+/// lists' `width × height` intermediate arrays (`None` for an unused
+/// list, at least one present) and the combine.
+pub(crate) struct PlanePrediction<'a> {
+    p0: Option<&'a [i32]>,
+    p1: Option<&'a [i32]>,
+    width: usize,
+    height: usize,
+    combine: Combine,
+}
+
+impl PlanePrediction<'_> {
+    /// The block's `(width, height)`.
+    pub(crate) fn size(&self) -> (usize, usize) {
+        (self.width, self.height)
     }
 
-    let shift1 = core::cmp::max(2, 14 - bit_depth as i32);
-    let shift2 = core::cmp::max(3, 15 - bit_depth as i32);
-    let offset1 = 1i32 << (shift1 - 1);
-    let offset2 = 1i32 << (shift2 - 1);
-    let max_val = (1i32 << bit_depth) - 1;
-
-    let mut out = vec![0i32; count];
-    match (pred_flag_l0, pred_flag_l1) {
-        // Uni-predictive from L0 (equation 8-262).
-        (true, false) => {
-            for (o, &p0) in out.iter_mut().zip(pred_l0) {
-                *o = ((p0 + offset1) >> shift1).clamp(0, max_val);
+    /// Row `y` of the final `[0, (1 << bitDepth) − 1]` prediction samples
+    /// into `out` (`width` long).
+    pub(crate) fn row<T: PredSample>(&self, y: usize, out: &mut [T]) {
+        let span = y * self.width..(y + 1) * self.width;
+        let p0 = self.p0.map(|p| &p[span.clone()]);
+        let p1 = self.p1.map(|p| &p[span]);
+        match self.combine {
+            Combine::Default {
+                shift1,
+                offset1,
+                shift2,
+                offset2,
+                max,
+            } => match (p0, p1) {
+                // Uni-predictive from L0 / L1 (equations 8-262 / 8-263).
+                (Some(p), None) | (None, Some(p)) => {
+                    for (o, &p) in out.iter_mut().zip(p) {
+                        *o = T::clipped(((p + offset1) >> shift1).clamp(0, max));
+                    }
+                }
+                // Bi-predictive (equation 8-264).
+                (Some(a), Some(b)) => {
+                    for ((o, &p0), &p1) in out.iter_mut().zip(a).zip(b) {
+                        *o = T::clipped(((p0 + p1 + offset2) >> shift2).clamp(0, max));
+                    }
+                }
+                (None, None) => {}
+            },
+            Combine::Explicit {
+                log2_wd,
+                w0,
+                o0,
+                w1,
+                o1,
+                max,
+            } => {
+                // Uni-predictive (equations 8-275 / 8-276).
+                let uni = |out: &mut [T], p: &[i32], w: i64, o: i64| {
+                    let round = 1i64 << (log2_wd - 1);
+                    for (d, &p) in out.iter_mut().zip(p) {
+                        *d = T::clipped(
+                            (((i64::from(p) * w + round) >> log2_wd) + o).clamp(0, max) as i32,
+                        );
+                    }
+                };
+                match (p0, p1) {
+                    (Some(p), None) => uni(out, p, w0, o0),
+                    (None, Some(p)) => uni(out, p, w1, o1),
+                    // Bi-predictive (equation 8-277).
+                    (Some(a), Some(b)) => {
+                        let round = (o0 + o1 + 1) << log2_wd;
+                        for ((o, &p0), &p1) in out.iter_mut().zip(a).zip(b) {
+                            *o = T::clipped(
+                                ((i64::from(p0) * w0 + i64::from(p1) * w1 + round) >> (log2_wd + 1))
+                                    .clamp(0, max) as i32,
+                            );
+                        }
+                    }
+                    (None, None) => {}
+                }
             }
         }
-        // Uni-predictive from L1 (equation 8-263).
-        (false, true) => {
-            for (o, &p1) in out.iter_mut().zip(pred_l1) {
-                *o = ((p1 + offset1) >> shift1).clamp(0, max_val);
-            }
-        }
-        // Bi-predictive (equation 8-264).
-        (true, true) => {
-            for ((o, &p0), &p1) in out.iter_mut().zip(pred_l0).zip(pred_l1) {
-                *o = ((p0 + p1 + offset2) >> shift2).clamp(0, max_val);
-            }
-        }
-        (false, false) => return Err(InterPredError::EmptyPlane),
     }
-    Ok(out)
+
+    /// Every row, row-major.
+    fn to_vec(&self) -> Vec<i32> {
+        let mut out = vec![0i32; self.width * self.height];
+        for (y, row) in out.chunks_exact_mut(self.width).enumerate() {
+            self.row(y, row);
+        }
+        out
+    }
+}
+
+/// A final prediction sample: [`PlanePrediction::row`] values lie in
+/// `[0, (1 << bitDepth) − 1]` with `bitDepth <= 16`, so either type holds
+/// them exactly.
+pub(crate) trait PredSample: Copy {
+    /// The sample for an already clipped value.
+    fn clipped(v: i32) -> Self;
+}
+
+impl PredSample for i32 {
+    #[inline(always)]
+    fn clipped(v: i32) -> Self {
+        v
+    }
+}
+
+impl PredSample for u16 {
+    #[inline(always)]
+    fn clipped(v: i32) -> Self {
+        v as u16
+    }
+}
+
+/// The first `n` elements of `buf`, growing it (never shrinking) to fit;
+/// callers overwrite every one of them.
+fn prefix(buf: &mut Vec<i32>, n: usize) -> &mut [i32] {
+    if buf.len() < n {
+        buf.resize(n, 0);
+    }
+    &mut buf[..n]
 }
 
 // ---------------------------------------------------------------------------
@@ -553,59 +872,23 @@ pub fn explicit_weighted_pred(
     o1: i32,
     bit_depth: u8,
 ) -> Result<Vec<i32>, InterPredError> {
-    if n_pb_w == 0 || n_pb_h == 0 {
-        return Err(InterPredError::EmptyBlock);
-    }
-    if !(8..=16).contains(&bit_depth) {
-        return Err(InterPredError::InvalidBitDepth(bit_depth));
-    }
-    let count = n_pb_w * n_pb_h;
-    if pred_flag_l0 && pred_l0.len() != count {
-        return Err(InterPredError::ArrayLengthMismatch {
-            expected: count,
-            got: pred_l0.len(),
-        });
-    }
-    if pred_flag_l1 && pred_l1.len() != count {
-        return Err(InterPredError::ArrayLengthMismatch {
-            expected: count,
-            got: pred_l1.len(),
-        });
-    }
-
-    // Equations 8-265 / 8-270: log2Wd = log2WeightDenom + shift1.
-    let shift1 = core::cmp::max(2, 14 - i64::from(bit_depth));
-    let log2_wd = i64::from(log2_weight_denom) + shift1;
-    let max_val = (1i64 << bit_depth) - 1;
-    let (w0, o0, w1, o1) = (i64::from(w0), i64::from(o0), i64::from(w1), i64::from(o1));
-
-    let mut out = vec![0i32; count];
-    match (pred_flag_l0, pred_flag_l1) {
-        // Uni-predictive from L0 (equation 8-275).
-        (true, false) => {
-            let round = 1i64 << (log2_wd - 1);
-            for (o, &p0) in out.iter_mut().zip(pred_l0) {
-                *o = ((((i64::from(p0) * w0 + round) >> log2_wd) + o0).clamp(0, max_val)) as i32;
-            }
-        }
-        // Uni-predictive from L1 (equation 8-276).
-        (false, true) => {
-            let round = 1i64 << (log2_wd - 1);
-            for (o, &p1) in out.iter_mut().zip(pred_l1) {
-                *o = ((((i64::from(p1) * w1 + round) >> log2_wd) + o1).clamp(0, max_val)) as i32;
-            }
-        }
-        // Bi-predictive (equation 8-277).
-        (true, true) => {
-            let round = (o0 + o1 + 1) << log2_wd;
-            for ((o, &p0), &p1) in out.iter_mut().zip(pred_l0).zip(pred_l1) {
-                *o = (((i64::from(p0) * w0 + i64::from(p1) * w1 + round) >> (log2_wd + 1))
-                    .clamp(0, max_val)) as i32;
-            }
-        }
-        (false, false) => return Err(InterPredError::EmptyPlane),
-    }
-    Ok(out)
+    check_combine(
+        pred_l0,
+        pred_l1,
+        pred_flag_l0,
+        pred_flag_l1,
+        n_pb_w,
+        n_pb_h,
+        bit_depth,
+    )?;
+    let pred = PlanePrediction {
+        p0: pred_flag_l0.then_some(pred_l0),
+        p1: pred_flag_l1.then_some(pred_l1),
+        width: n_pb_w,
+        height: n_pb_h,
+        combine: Combine::new(bit_depth, Some((log2_weight_denom, w0, o0, w1, o1))),
+    };
+    Ok(pred.to_vec())
 }
 
 /// One reference list's §8.5.3.3.4.3 weights / offsets for one PU,
@@ -721,55 +1004,102 @@ fn sub_wh_c_local(chroma_array_type: u8) -> (i32, i32) {
     }
 }
 
-/// Fill one list's intermediate luma prediction array for a PU
-/// (§8.5.3.3.3.1 equations 8-214..8-217 + the §8.5.3.3.3.2 per-sample
-/// interpolation). `xPb`/`yPb` are added inside the integer split.
-fn list_luma_pred(
+/// The per-list working buffers of one PU prediction: the interpolation
+/// window / rows and the two lists' intermediate prediction arrays.
+#[derive(Default)]
+struct PredWork {
+    interp: InterpScratch,
+    l0: Vec<i32>,
+    l1: Vec<i32>,
+}
+
+/// Reusable per-thread buffers of the interpolation entry points and the
+/// PU driver.
+#[derive(Default)]
+struct PredScratch {
+    work: PredWork,
+}
+
+thread_local! {
+    static PRED_SCRATCH: RefCell<PredScratch> = RefCell::new(PredScratch::default());
+}
+
+/// Runs `f` with this thread's [`PredScratch`], or with fresh buffers
+/// when they are already borrowed further up the stack.
+fn with_scratch<R>(f: impl FnOnce(&mut PredScratch) -> R) -> R {
+    PRED_SCRATCH.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut scratch) => f(&mut scratch),
+        Err(_) => f(&mut PredScratch::default()),
+    })
+}
+
+/// Fill one list's intermediate luma prediction array for a PU into the
+/// first `nPbW * nPbH` elements of `out` (§8.5.3.3.3.1 equations
+/// 8-214..8-217 + the §8.5.3.3.3.2 interpolation); returns that count.
+/// `xPb`/`yPb` are added inside the integer split.
+fn list_luma_into(
     list: &ListPrediction<'_>,
     geom: &InterPredGeometry,
-) -> Result<Vec<i32>, InterPredError> {
+    scratch: &mut InterpScratch,
+    out: &mut Vec<i32>,
+) -> Result<usize, InterPredError> {
     // §8.5.3.3.3.1: xIntL = xPb + (mvLX[0] >> 2), xFracL = mvLX[0] & 3.
     let x_int = geom.x_pb + (list.mv_l[0] >> 2);
     let y_int = geom.y_pb + (list.mv_l[1] >> 2);
     let x_frac = list.mv_l[0] & 3;
     let y_frac = list.mv_l[1] & 3;
-    interp_luma_block(
+    let (w, h) = (geom.n_pb_w, geom.n_pb_h);
+    check_interp(w, h, x_frac, y_frac, 3, geom.bit_depth_luma)?;
+    let kernel = |f: i32| (f != 0).then(|| &LUMA_FILTER[f as usize]);
+    interp_into(
         &list.luma,
         x_int,
         y_int,
-        x_frac,
-        y_frac,
-        geom.n_pb_w,
-        geom.n_pb_h,
+        kernel(x_frac),
+        kernel(y_frac),
+        w,
         geom.bit_depth_luma,
-    )
+        scratch,
+        prefix(out, w * h),
+    );
+    Ok(w * h)
 }
 
-/// Fill one list's intermediate chroma prediction array for a PU
-/// (§8.5.3.3.3.1 equations 8-218..8-221 + §8.5.3.3.3.3 interpolation).
-fn list_chroma_pred(
+/// Fill one list's intermediate chroma prediction array for a PU into the
+/// first `(nPbW / SubWidthC) * (nPbH / SubHeightC)` elements of `out`
+/// (§8.5.3.3.3.1 equations 8-218..8-221 + §8.5.3.3.3.3 interpolation);
+/// returns that count.
+#[allow(clippy::too_many_arguments)]
+fn list_chroma_into(
     plane: &RefPlane<'_>,
     list: &ListPrediction<'_>,
     geom: &InterPredGeometry,
     sub_w: i32,
     sub_h: i32,
-) -> Result<Vec<i32>, InterPredError> {
+    scratch: &mut InterpScratch,
+    out: &mut Vec<i32>,
+) -> Result<usize, InterPredError> {
     // §8.5.3.3.3.1: xIntC = (xPb / SubWidthC) + (mvCLX[0] >> 3),
     //               xFracC = mvCLX[0] & 7.
     let x_int = geom.x_pb / sub_w + (list.mv_c[0] >> 3);
     let y_int = geom.y_pb / sub_h + (list.mv_c[1] >> 3);
     let x_frac = list.mv_c[0] & 7;
     let y_frac = list.mv_c[1] & 7;
-    interp_chroma_block(
+    let (w, h) = (geom.n_pb_w / sub_w as usize, geom.n_pb_h / sub_h as usize);
+    check_interp(w, h, x_frac, y_frac, 7, geom.bit_depth_chroma)?;
+    let kernel = |f: i32| (f != 0).then(|| &CHROMA_FILTER[f as usize]);
+    interp_into(
         plane,
         x_int,
         y_int,
-        x_frac,
-        y_frac,
-        geom.n_pb_w / sub_w as usize,
-        geom.n_pb_h / sub_h as usize,
+        kernel(x_frac),
+        kernel(y_frac),
+        w,
         geom.bit_depth_chroma,
-    )
+        scratch,
+        prefix(out, w * h),
+    );
+    Ok(w * h)
 }
 
 /// §8.5.3.3.1 — drive the inter-prediction sample process for one
@@ -811,6 +1141,28 @@ pub fn predict_inter_pu_weighted(
     geom: &InterPredGeometry,
     weights: Option<&PuWeights>,
 ) -> Result<InterPrediction, InterPredError> {
+    let mut planes: [Vec<i32>; 3] = Default::default();
+    for_each_plane_prediction(l0, l1, geom, weights, |c_idx, pred| {
+        planes[c_idx] = pred.to_vec();
+    })?;
+    let [luma, cb, cr] = planes;
+    Ok(InterPrediction { luma, cb, cr })
+}
+
+/// [`predict_inter_pu_weighted`] one plane at a time without allocating:
+/// `sink` receives each component index (`0` luma, `1` Cb, `2` Cr; no
+/// chroma when monochrome) with its [`PlanePrediction`], which borrows
+/// this thread's reusable buffers.
+///
+/// # Errors
+/// Same contract as [`predict_inter_pu`].
+pub(crate) fn for_each_plane_prediction(
+    l0: &ListPrediction<'_>,
+    l1: &ListPrediction<'_>,
+    geom: &InterPredGeometry,
+    weights: Option<&PuWeights>,
+    mut sink: impl FnMut(usize, &PlanePrediction<'_>),
+) -> Result<(), InterPredError> {
     if geom.n_pb_w == 0 || geom.n_pb_h == 0 {
         return Err(InterPredError::EmptyBlock);
     }
@@ -818,123 +1170,115 @@ pub fn predict_inter_pu_weighted(
         return Err(InterPredError::EmptyPlane);
     }
 
-    // Luma: interpolate each used list, then combine per §8.5.3.3.4.1.
-    let pred_l0_luma = if l0.pred_flag {
-        list_luma_pred(l0, geom)?
-    } else {
-        Vec::new()
-    };
-    let pred_l1_luma = if l1.pred_flag {
-        list_luma_pred(l1, geom)?
-    } else {
-        Vec::new()
-    };
-    let luma = match weights {
-        None => default_weighted_pred(
-            &pred_l0_luma,
-            &pred_l1_luma,
-            l0.pred_flag,
-            l1.pred_flag,
-            geom.n_pb_w,
-            geom.n_pb_h,
-            geom.bit_depth_luma,
-        )?,
-        Some(wp) => explicit_weighted_pred(
-            &pred_l0_luma,
-            &pred_l1_luma,
-            l0.pred_flag,
-            l1.pred_flag,
-            geom.n_pb_w,
-            geom.n_pb_h,
-            wp.luma_log2_weight_denom,
-            wp.l0.w_luma,
-            wp.l0.o_luma,
-            wp.l1.w_luma,
-            wp.l1.o_luma,
-            geom.bit_depth_luma,
-        )?,
-    };
-
-    let (mut cb, mut cr) = (Vec::new(), Vec::new());
-    if geom.chroma_array_type != 0 {
-        let (sub_w, sub_h) = sub_wh_c_local(geom.chroma_array_type);
-        let wp_cb = weights.map(|wp| {
+    with_scratch(|scratch| {
+        let work = &mut scratch.work;
+        // Luma: interpolate each used list, then combine per §8.5.3.3.4.1.
+        let (mut n0, mut n1) = (0, 0);
+        if l0.pred_flag {
+            n0 = list_luma_into(l0, geom, &mut work.interp, &mut work.l0)?;
+        }
+        if l1.pred_flag {
+            n1 = list_luma_into(l1, geom, &mut work.interp, &mut work.l1)?;
+        }
+        let luma_weights = weights.map(|wp| {
             (
-                wp.chroma_log2_weight_denom,
-                wp.l0.w_cb,
-                wp.l0.o_cb,
-                wp.l1.w_cb,
-                wp.l1.o_cb,
+                wp.luma_log2_weight_denom,
+                wp.l0.w_luma,
+                wp.l0.o_luma,
+                wp.l1.w_luma,
+                wp.l1.o_luma,
             )
         });
-        let wp_cr = weights.map(|wp| {
-            (
-                wp.chroma_log2_weight_denom,
-                wp.l0.w_cr,
-                wp.l0.o_cr,
-                wp.l1.w_cr,
-                wp.l1.o_cr,
-            )
-        });
-        cb = combine_chroma(l0, l1, geom, sub_w, sub_h, wp_cb, |lp| lp.cb)?;
-        cr = combine_chroma(l0, l1, geom, sub_w, sub_h, wp_cr, |lp| lp.cr)?;
-    }
+        sink(
+            0,
+            &PlanePrediction {
+                p0: l0.pred_flag.then(|| &work.l0[..n0]),
+                p1: l1.pred_flag.then(|| &work.l1[..n1]),
+                width: geom.n_pb_w,
+                height: geom.n_pb_h,
+                combine: Combine::new(geom.bit_depth_luma, luma_weights),
+            },
+        );
 
-    Ok(InterPrediction { luma, cb, cr })
+        if geom.chroma_array_type != 0 {
+            let sub = sub_wh_c_local(geom.chroma_array_type);
+            let wp_cb = weights.map(|wp| {
+                (
+                    wp.chroma_log2_weight_denom,
+                    wp.l0.w_cb,
+                    wp.l0.o_cb,
+                    wp.l1.w_cb,
+                    wp.l1.o_cb,
+                )
+            });
+            let wp_cr = weights.map(|wp| {
+                (
+                    wp.chroma_log2_weight_denom,
+                    wp.l0.w_cr,
+                    wp.l0.o_cr,
+                    wp.l1.w_cr,
+                    wp.l1.o_cr,
+                )
+            });
+            sink(
+                1,
+                &chroma_prediction(l0, l1, geom, sub, wp_cb, |lp| lp.cb, work)?,
+            );
+            sink(
+                2,
+                &chroma_prediction(l0, l1, geom, sub, wp_cr, |lp| lp.cr, work)?,
+            );
+        }
+        Ok(())
+    })
 }
 
-/// Interpolate and §8.5.3.3.4-combine one chroma component for a PU.
-/// `select` picks the Cb or Cr reference plane from a [`ListPrediction`];
-/// `wp` is `Some((ChromaLog2WeightDenom, w0, o0, w1, o1))` for the
-/// §8.5.3.3.4.3 explicit path, `None` for the §8.5.3.3.4.2 default.
-fn combine_chroma<'a>(
+/// Interpolate one chroma component of a PU into `work` and describe its
+/// §8.5.3.3.4 combine. `select` picks the Cb or Cr reference plane from a
+/// [`ListPrediction`]; `wp` is `Some((ChromaLog2WeightDenom, w0, o0, w1,
+/// o1))` for the §8.5.3.3.4.3 explicit path, `None` for the §8.5.3.3.4.2
+/// default.
+fn chroma_prediction<'w, 'a>(
     l0: &ListPrediction<'a>,
     l1: &ListPrediction<'a>,
     geom: &InterPredGeometry,
-    sub_w: i32,
-    sub_h: i32,
+    (sub_w, sub_h): (i32, i32),
     wp: Option<(u8, i32, i32, i32, i32)>,
     select: impl Fn(&ListPrediction<'a>) -> Option<RefPlane<'a>>,
-) -> Result<Vec<i32>, InterPredError> {
-    let cw = geom.n_pb_w / sub_w as usize;
-    let ch = geom.n_pb_h / sub_h as usize;
-    let p0 = if l0.pred_flag {
+    work: &'w mut PredWork,
+) -> Result<PlanePrediction<'w>, InterPredError> {
+    let (mut n0, mut n1) = (0, 0);
+    if l0.pred_flag {
         let plane = select(l0).ok_or(InterPredError::EmptyPlane)?;
-        list_chroma_pred(&plane, l0, geom, sub_w, sub_h)?
-    } else {
-        Vec::new()
-    };
-    let p1 = if l1.pred_flag {
-        let plane = select(l1).ok_or(InterPredError::EmptyPlane)?;
-        list_chroma_pred(&plane, l1, geom, sub_w, sub_h)?
-    } else {
-        Vec::new()
-    };
-    match wp {
-        None => default_weighted_pred(
-            &p0,
-            &p1,
-            l0.pred_flag,
-            l1.pred_flag,
-            cw,
-            ch,
-            geom.bit_depth_chroma,
-        ),
-        Some((denom, w0, o0, w1, o1)) => explicit_weighted_pred(
-            &p0,
-            &p1,
-            l0.pred_flag,
-            l1.pred_flag,
-            cw,
-            ch,
-            denom,
-            w0,
-            o0,
-            w1,
-            o1,
-            geom.bit_depth_chroma,
-        ),
+        n0 = list_chroma_into(
+            &plane,
+            l0,
+            geom,
+            sub_w,
+            sub_h,
+            &mut work.interp,
+            &mut work.l0,
+        )?;
     }
+    if l1.pred_flag {
+        let plane = select(l1).ok_or(InterPredError::EmptyPlane)?;
+        n1 = list_chroma_into(
+            &plane,
+            l1,
+            geom,
+            sub_w,
+            sub_h,
+            &mut work.interp,
+            &mut work.l1,
+        )?;
+    }
+    Ok(PlanePrediction {
+        p0: l0.pred_flag.then(|| &work.l0[..n0]),
+        p1: l1.pred_flag.then(|| &work.l1[..n1]),
+        width: geom.n_pb_w / sub_w as usize,
+        height: geom.n_pb_h / sub_h as usize,
+        combine: Combine::new(geom.bit_depth_chroma, wp),
+    })
 }
 
 #[cfg(test)]

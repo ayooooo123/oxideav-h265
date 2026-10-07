@@ -53,22 +53,45 @@ fn complete_ffmpeg_oracles_and_seeded_mutation_recovery() {
         let reference = Command::new("ffmpeg")
             .args(["-v", "error", "-nostdin", "-threads", "1", "-i"])
             .arg(&input)
-            .args(["-map", "0:v:0", "-fps_mode", "passthrough", "-pix_fmt",
-                if wide { "yuv420p10le" } else { "yuv420p" }, "-f", "rawvideo", "-"])
-            .output().expect("FFmpeg oracle required");
-        assert!(reference.status.success(), "{name}: {}", String::from_utf8_lossy(&reference.stderr));
+            .args([
+                "-map",
+                "0:v:0",
+                "-fps_mode",
+                "passthrough",
+                "-pix_fmt",
+                if wide { "yuv420p10le" } else { "yuv420p" },
+                "-f",
+                "rawvideo",
+                "-",
+            ])
+            .output()
+            .expect("FFmpeg oracle required");
+        assert!(
+            reference.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&reference.stderr)
+        );
         let expected = reference.stdout;
         std::fs::write(dir.join(format!("{name}.yuv")), &expected).unwrap();
         let (count, serial) = decoded(stream, 1, wide);
-        assert!(serial == expected, "{name}: complete serial output differs from FFmpeg");
+        assert!(
+            serial == expected,
+            "{name}: complete serial output differs from FFmpeg"
+        );
         let (parallel_count, parallel) = decoded(stream, 2, wide);
         assert_eq!(parallel_count, count, "{name}: band frame count");
-        assert!(parallel == expected, "{name}: complete band output differs from FFmpeg");
+        assert!(
+            parallel == expected,
+            "{name}: complete band output differs from FFmpeg"
+        );
 
         // Change VCL payload only: retain the original VPS/SPS/PPS geometry
         // and transport headers, while reaching the actual CABAC/recon path.
-        let starts: Vec<_> = stream.windows(3).enumerate()
-            .filter_map(|(i, bytes)| (bytes == [0, 0, 1]).then_some(i + 3)).collect();
+        let starts: Vec<_> = stream
+            .windows(3)
+            .enumerate()
+            .filter_map(|(i, bytes)| (bytes == [0, 0, 1]).then_some(i + 3))
+            .collect();
         let mut payload = Vec::new();
         for (i, &start) in starts.iter().enumerate() {
             let end = starts.get(i + 1).map_or(stream.len(), |next| next - 3);
@@ -95,8 +118,14 @@ fn complete_ffmpeg_oracles_and_seeded_mutation_recovery() {
             // SequenceDecoder explicitly leaves state unspecified on error;
             // recreation is its recovery contract, not an invented reset API.
             let (recovered_count, recovered) = decoded(stream, 1, wide);
-            assert_eq!(recovered_count, count, "{name}: recovery count, trial {trial}");
-            assert!(recovered == expected, "{name}: complete recovery, trial {trial}");
+            assert_eq!(
+                recovered_count, count,
+                "{name}: recovery count, trial {trial}"
+            );
+            assert!(
+                recovered == expected,
+                "{name}: complete recovery, trial {trial}"
+            );
         }
         eprintln!("{name}: {count} frames, {} bytes, FFmpeg MD5 {}, serial/bands + 128 mutations/recoveries exact",
             expected.len(), md5::hex(&expected));

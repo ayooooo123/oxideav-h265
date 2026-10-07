@@ -75,6 +75,33 @@ impl<'a> BitReader<'a> {
         Ok((byte >> bit) & 0x01)
     }
 
+    /// Read `n` bits (`1..=8`) MSB-first: the CABAC engine's
+    /// renormalization / bypass read. Same result and errors as
+    /// [`Self::u`], served from the two bytes at the cursor.
+    #[inline]
+    pub(crate) fn short(&mut self, n: u32) -> Result<u32, BitReaderError> {
+        debug_assert!((1..=8).contains(&n));
+        let byte = self.bit_pos / 8;
+        match self.buf.get(byte..byte + 2) {
+            Some(&[b0, b1]) => {
+                // The cursor's bit is bit `15 - bit_pos % 8` of the pair,
+                // and `bit_pos % 8 + n <= 15`.
+                let pair = u32::from(b0) << 8 | u32::from(b1);
+                let value = (pair >> (16 - (self.bit_pos % 8) as u32 - n)) & ((1 << n) - 1);
+                self.bit_pos += n as usize;
+                Ok(value)
+            }
+            _ => self.short_at_end(n),
+        }
+    }
+
+    /// [`Self::short`] within the last byte of the buffer.
+    #[cold]
+    #[inline(never)]
+    fn short_at_end(&mut self, n: u32) -> Result<u32, BitReaderError> {
+        self.u(n as u8)
+    }
+
     /// Read `n` bits MSB-first as an unsigned integer (the `u(n)`
     /// descriptor, with `n` in `0..=32`). `n == 0` returns 0 and does
     /// not advance the cursor.
@@ -88,11 +115,22 @@ impl<'a> BitReader<'a> {
         if self.bits_left() < n as usize {
             return Err(BitReaderError::EndOfBuffer);
         }
-        let mut value: u32 = 0;
-        for _ in 0..n {
-            value = (value << 1) | (self.u1()? as u32);
-        }
-        Ok(value)
+        // The `n` bits start `bit_pos % 8 <= 7` bits into the cursor's
+        // byte, so they lie within the eight bytes from it (bytes past
+        // the buffer end read as zero and are never selected).
+        let byte = self.bit_pos / 8;
+        let window = match self.buf.get(byte..byte + 8) {
+            Some(eight) => u64::from_be_bytes(eight.try_into().unwrap()),
+            None => {
+                let mut window = [0u8; 8];
+                let tail = &self.buf[byte..];
+                window[..tail.len()].copy_from_slice(tail);
+                u64::from_be_bytes(window)
+            }
+        };
+        let bits = window << (self.bit_pos % 8);
+        self.bit_pos += usize::from(n);
+        Ok((bits >> (64 - u32::from(n))) as u32)
     }
 
     /// Skip `n` bits without interpreting them. Useful when a syntax

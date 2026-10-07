@@ -988,6 +988,33 @@ impl MotionField {
         }
     }
 
+    /// [`Self::new`] reusing the storage of `self`, a field nothing reads
+    /// any more: every cell becomes the intra background again, without
+    /// a fresh allocation when the old capacity suffices.
+    #[must_use]
+    pub(crate) fn recycled(self, width_luma: usize, height_luma: usize) -> Self {
+        let Self {
+            mut flags,
+            mut motion,
+            ..
+        } = self;
+        let width_4 = width_luma.div_ceil(4);
+        let height_4 = height_luma.div_ceil(4);
+        flags.clear();
+        flags.resize(width_4 * height_4, FLAG_INTRA);
+        motion.clear();
+        Self {
+            width_4,
+            height_4,
+            origin_4: 0,
+            rows_4: height_4,
+            origin_4x: 0,
+            cols_4: width_4,
+            flags,
+            motion,
+        }
+    }
+
     /// A band of a `width_luma × height_luma` field storing only the
     /// cell rows covering luma rows `y_origin_luma .. y_origin_luma +
     /// band_rows_luma` (both multiples of 4); every accessor still takes
@@ -1160,7 +1187,7 @@ impl MotionField {
     #[inline]
     fn motion_mut(&mut self) -> &mut [CellMotion] {
         if self.motion.is_empty() {
-            self.motion = vec![NO_MOTION; self.cols_4 * self.rows_4];
+            self.motion.resize(self.cols_4 * self.rows_4, NO_MOTION);
         }
         &mut self.motion
     }

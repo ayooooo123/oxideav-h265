@@ -308,29 +308,19 @@ impl BoundaryStrength {
 /// list-independent (spec NOTE 1): block p uses reference-picture set
 /// `{ p.l0?, p.l1? }`, block q uses `{ q.l0?, q.l1? }`.
 fn different_refs_or_count(p: &crate::motion::MotionCell, q: &crate::motion::MotionCell) -> bool {
-    let p_count = u8::from(p.pred_flag_l0) + u8::from(p.pred_flag_l1);
-    let q_count = u8::from(q.pred_flag_l0) + u8::from(q.pred_flag_l1);
-    if p_count != q_count {
-        return true;
-    }
-    // Compare the *sets* of reference pictures (POCs), list-independent.
-    let mut p_refs = Vec::new();
-    if p.pred_flag_l0 {
-        p_refs.push(p.ref_poc_l0);
-    }
-    if p.pred_flag_l1 {
-        p_refs.push(p.ref_poc_l1);
-    }
-    let mut q_refs = Vec::new();
-    if q.pred_flag_l0 {
-        q_refs.push(q.ref_poc_l0);
-    }
-    if q.pred_flag_l1 {
-        q_refs.push(q.ref_poc_l1);
-    }
-    p_refs.sort_unstable();
-    q_refs.sort_unstable();
-    p_refs != q_refs
+    // Compare the *sets* of reference pictures (POCs), list-independent:
+    // each block's used references, sorted, with `None` for an absent
+    // one. A different count of motion vectors differs in the `None`s.
+    let refs = |c: &crate::motion::MotionCell| match (c.pred_flag_l0, c.pred_flag_l1) {
+        (true, true) => {
+            let (a, b) = (c.ref_poc_l0, c.ref_poc_l1);
+            [Some(a.min(b)), Some(a.max(b))]
+        }
+        (true, false) => [Some(c.ref_poc_l0), None],
+        (false, true) => [Some(c.ref_poc_l1), None],
+        (false, false) => [None, None],
+    };
+    refs(p) != refs(q)
 }
 
 /// `|a − b| >= 4` on either component (the §8.7.2.4 quarter-luma-sample
@@ -912,45 +902,75 @@ pub fn filter_luma_block_edge_gated(
         qp.bit_depth,
     );
     let bit_depth = qp.bit_depth;
-    // Gather the decision grid: rows k=0 and k=3, samples i=0..3 each side.
-    let mut pg = [[0i32; 2]; 4];
-    let mut qg = [[0i32; 2]; 4];
-    for (k_idx, &k) in [0usize, 3].iter().enumerate() {
-        for i in 0..4 {
-            let (px, py) = plane.edge_xy(ex, ey, edge, true, i, k);
-            let (qx, qy) = plane.edge_xy(ex, ey, edge, false, i, k);
-            pg[i][k_idx] = plane.get(px, py);
-            qg[i][k_idx] = plane.get(qx, qy);
+    // The eight samples across the edge on each of its four lines:
+    // `s[k][3 - i]` is `p_i,k` and `s[k][4 + i]` is `q_i,k`.
+    let mut s = [[0i32; 8]; 4];
+    let at = |x: usize, y: usize| (y - plane.y_origin) * plane.stride + x;
+    match edge {
+        EdgeType::Vertical => {
+            for (k, line) in s.iter_mut().enumerate() {
+                let o = at(ex - 4, ey + k);
+                for (d, &v) in line.iter_mut().zip(&plane.samples[o..o + 8]) {
+                    *d = i32::from(v);
+                }
+            }
+        }
+        EdgeType::Horizontal => {
+            for j in 0..8 {
+                let o = at(ex, ey + j - 4);
+                for (line, &v) in s.iter_mut().zip(&plane.samples[o..o + 4]) {
+                    line[j] = i32::from(v);
+                }
+            }
         }
     }
+    // `p0..p3` / `q0..q3` of line `k`.
+    let p_side = |s: &[[i32; 8]; 4], k: usize| [s[k][3], s[k][2], s[k][1], s[k][0]];
+    let q_side = |s: &[[i32; 8]; 4], k: usize| [s[k][4], s[k][5], s[k][6], s[k][7]];
+    // The decision grid: lines k = 0 and k = 3, samples i = 0..3 each side.
+    let (p0l, p3l, q0l, q3l) = (p_side(&s, 0), p_side(&s, 3), q_side(&s, 0), q_side(&s, 3));
+    let pg: [[i32; 2]; 4] = core::array::from_fn(|i| [p0l[i], p3l[i]]);
+    let qg: [[i32; 2]; 4] = core::array::from_fn(|i| [q0l[i], q3l[i]]);
     let dec = luma_edge_decision(pg, qg, beta, tc);
     if dec.de == 0 {
         return dec;
     }
-    // Apply the filter to each of the 4 rows (eq. 8-372/8-373 layout).
+    // Apply the filter to each of the 4 lines (eq. 8-372/8-373 layout).
     for k in 0..4 {
-        let mut p = [0i32; 4];
-        let mut q = [0i32; 4];
-        for i in 0..4 {
-            let (px, py) = plane.edge_xy(ex, ey, edge, true, i, k);
-            let (qx, qy) = plane.edge_xy(ex, ey, edge, false, i, k);
-            p[i] = plane.get(px, py);
-            q[i] = plane.get(qx, qy);
-        }
+        let (p, q) = (p_side(&s, k), q_side(&s, k));
         let out = filter_luma_sample(p, q, dec.de, dec.dep, dec.deq, tc, bit_depth);
         for i in 0..out.ndp {
             let (px, py) = plane.edge_xy(ex, ey, edge, true, i, k);
             if no_filter.is_some_and(|m| m.at_luma(px, py)) {
                 continue; // §8.7.2.5.4 nDp = 0 (PCM / bypass / palette)
             }
-            plane.set(px, py, out.p[i]);
+            s[k][3 - i] = out.p[i];
         }
         for j in 0..out.ndq {
             let (qx, qy) = plane.edge_xy(ex, ey, edge, false, j, k);
             if no_filter.is_some_and(|m| m.at_luma(qx, qy)) {
                 continue; // §8.7.2.5.4 nDq = 0
             }
-            plane.set(qx, qy, out.q[j]);
+            s[k][4 + j] = out.q[j];
+        }
+    }
+    // Store the lines back (unfiltered samples keep their values).
+    match edge {
+        EdgeType::Vertical => {
+            for (k, line) in s.iter().enumerate() {
+                let o = at(ex - 4, ey + k);
+                for (d, &v) in plane.samples[o..o + 8].iter_mut().zip(line) {
+                    *d = v as u16;
+                }
+            }
+        }
+        EdgeType::Horizontal => {
+            for j in 0..8 {
+                let o = at(ex, ey + j - 4);
+                for (d, line) in plane.samples[o..o + 4].iter_mut().zip(&s) {
+                    *d = line[j] as u16;
+                }
+            }
         }
     }
     dec
@@ -1551,6 +1571,12 @@ impl DeblockEdgeMap {
     /// Derive one coding unit's §8.7.2.2 / .3 edge flags and §8.7.2.4
     /// strengths in both directions from `field` (which must already
     /// hold the CU and its left / above neighbours) and record them.
+    ///
+    /// Only the §8.7.2.4 sampled positions (every 8th column × 4th row
+    /// for vertical edges, transposed for horizontal ones) carry a
+    /// strength, so the edge flags are derived at those positions alone:
+    /// the same values [`derive_edge_flags`] and
+    /// [`derive_boundary_strength`] give there.
     pub fn add_cu(&mut self, field: &MotionField, desc: &DeblockCuDesc) {
         let DeblockCu {
             x_cb,
@@ -1561,62 +1587,208 @@ impl DeblockEdgeMap {
         if self.params.is_none() {
             self.params = Some(desc.cu.params);
         }
-        let n_d = 1usize << (log2_cb_size - 3);
         for edge_type in [EdgeType::Vertical, EdgeType::Horizontal] {
             let filter_edge_flag = match edge_type {
                 EdgeType::Vertical => desc.filter_left,
                 EdgeType::Horizontal => desc.filter_top,
             };
-            let ef = derive_edge_flags(
+            let grid = SampledEdges::derive(
                 &desc.transform_split,
                 desc.part_mode,
                 log2_cb_size,
                 edge_type,
                 filter_edge_flag,
             );
-            let bs = derive_boundary_strength(
-                field,
-                x_cb,
-                y_cb,
-                log2_cb_size,
-                edge_type,
-                ef.edge_flags(),
-                ef.tb_edge(),
-            );
-            for e in 0..n_d {
-                for s_idx in 0..2 * n_d {
-                    let (x_dk, y_dm) = match edge_type {
-                        EdgeType::Vertical => (e << 3, s_idx << 2),
-                        EdgeType::Horizontal => (s_idx << 2, e << 3),
-                    };
-                    let v = bs.at(x_dk, y_dm);
-                    if v == 0 {
-                        continue;
-                    }
-                    let (x, y) = (x_cb + x_dk, y_cb + y_dm);
-                    if y < self.y_origin
-                        || y >= self.y_origin + self.rows
-                        || x < self.x_origin
-                        || x >= self.x_origin + self.cols
-                    {
-                        continue;
-                    }
-                    let (x, y) = (x - self.x_origin, y - self.y_origin);
-                    match edge_type {
-                        EdgeType::Vertical => {
-                            if let Some(c) = self.bs_v.get_mut((y >> 2) * self.w8 + (x >> 3)) {
-                                *c = v;
-                            }
+            for (idx, &flags) in grid.flags[..grid.len()].iter().enumerate() {
+                if flags & SampledEdges::EDGE == 0 {
+                    continue;
+                }
+                let (x_d, y_d) = grid.position(idx);
+                // p0 / q0 sample positions (§8.7.2.4).
+                let (px, py) = match edge_type {
+                    EdgeType::Vertical => (x_cb + x_d - 1, y_cb + y_d),
+                    EdgeType::Horizontal => (x_cb + x_d, y_cb + y_d - 1),
+                };
+                let p = field.cell_at(px, py);
+                let q = field.cell_at(x_cb + x_d, y_cb + y_d);
+                // §8.7.2.4 cascade: intra ⇒ 2; else a coded-coeff
+                // transform-block edge OR the motion criteria ⇒ 1; else 0.
+                let coeff_edge =
+                    flags & SampledEdges::TB != 0 && (p.has_nonzero_coeff || q.has_nonzero_coeff);
+                let v = if p.is_intra || q.is_intra {
+                    2
+                } else if coeff_edge || motion_bs_is_one(&p, &q) {
+                    1
+                } else {
+                    0
+                };
+                if v == 0 {
+                    continue;
+                }
+                let (x, y) = (x_cb + x_d, y_cb + y_d);
+                if y < self.y_origin
+                    || y >= self.y_origin + self.rows
+                    || x < self.x_origin
+                    || x >= self.x_origin + self.cols
+                {
+                    continue;
+                }
+                let (x, y) = (x - self.x_origin, y - self.y_origin);
+                match edge_type {
+                    EdgeType::Vertical => {
+                        if let Some(c) = self.bs_v.get_mut((y >> 2) * self.w8 + (x >> 3)) {
+                            *c = v;
                         }
-                        EdgeType::Horizontal => {
-                            if let Some(c) = self.bs_h.get_mut((y >> 3) * self.w4 + (x >> 2)) {
-                                *c = v;
-                            }
+                    }
+                    EdgeType::Horizontal => {
+                        if let Some(c) = self.bs_h.get_mut((y >> 3) * self.w4 + (x >> 2)) {
+                            *c = v;
                         }
                     }
                 }
             }
         }
+    }
+}
+
+/// The §8.7.2.2 / §8.7.2.3 edge flags of one coding block in one
+/// direction, at the §8.7.2.4 sampled positions only: columns `0, 8, …`
+/// × rows `0, 4, …` for vertical edges, columns `0, 4, …` × rows `0, 8,
+/// …` for horizontal ones (at most 8 × 16 for a 64 × 64 block).
+struct SampledEdges {
+    /// Per position, [`Self::EDGE`] (`edgeFlags`) and [`Self::TB`] (a
+    /// transform-block edge), row-major.
+    flags: [u8; 128],
+    /// Sampled columns per row.
+    cols: usize,
+    rows: usize,
+    step: (usize, usize),
+}
+
+impl SampledEdges {
+    const EDGE: u8 = 1;
+    const TB: u8 = 2;
+
+    fn derive(
+        split: &TransformSplit,
+        part_mode: PartMode,
+        log2_cb_size: u32,
+        edge_type: EdgeType,
+        filter_edge_flag: bool,
+    ) -> Self {
+        let n = 1usize << log2_cb_size;
+        let step = match edge_type {
+            EdgeType::Vertical => (8, 4),
+            EdgeType::Horizontal => (4, 8),
+        };
+        let mut grid = Self {
+            flags: [0; 128],
+            cols: n.div_ceil(step.0),
+            rows: n.div_ceil(step.1),
+            step,
+        };
+        assert!(grid.len() <= grid.flags.len(), "coding block above 64 × 64");
+        // §8.7.2.2: each transform block's leading edge, gated at the
+        // coding-block boundary by filterEdgeFlag.
+        grid.mark_transform_edges(split, (0, 0), log2_cb_size, edge_type, filter_edge_flag);
+        // §8.7.2.3: the internal prediction-partition edge (never on the
+        // coding-block boundary) is an edge but not a transform edge.
+        let half = n / 2;
+        let quarter = 1usize << log2_cb_size.saturating_sub(2);
+        let pos = match (edge_type, part_mode) {
+            (EdgeType::Vertical, PartMode::PartNx2N | PartMode::PartNxN) => Some(half),
+            (EdgeType::Vertical, PartMode::PartNLx2N) => Some(quarter),
+            (EdgeType::Vertical, PartMode::PartNRx2N) => Some(3 * quarter),
+            (EdgeType::Horizontal, PartMode::Part2NxN | PartMode::PartNxN) => Some(half),
+            (EdgeType::Horizontal, PartMode::Part2NxnU) => Some(quarter),
+            (EdgeType::Horizontal, PartMode::Part2NxnD) => Some(3 * quarter),
+            _ => None,
+        };
+        if let Some(p) = pos {
+            grid.mark_line(edge_type, p, 0, n, Self::EDGE, true);
+        }
+        grid
+    }
+
+    fn len(&self) -> usize {
+        self.cols * self.rows
+    }
+
+    /// The coding-block-relative luma position of sampled index `idx`.
+    fn position(&self, idx: usize) -> (usize, usize) {
+        (
+            (idx % self.cols) * self.step.0,
+            (idx / self.cols) * self.step.1,
+        )
+    }
+
+    /// Set (`or == true`) or assign (`or == false`) `bits` on the sampled
+    /// positions of the edge line at offset `at` across the block (a
+    /// column for vertical edges, a row for horizontal ones), over the
+    /// `len` samples from `from` along it.
+    fn mark_line(
+        &mut self,
+        edge_type: EdgeType,
+        at: usize,
+        from: usize,
+        len: usize,
+        bits: u8,
+        or: bool,
+    ) {
+        let (across, along) = match edge_type {
+            EdgeType::Vertical => (self.step.0, self.step.1),
+            EdgeType::Horizontal => (self.step.1, self.step.0),
+        };
+        if at % across != 0 {
+            return;
+        }
+        for k in (from.div_ceil(along) * along..from + len).step_by(along) {
+            let (x, y) = match edge_type {
+                EdgeType::Vertical => (at, k),
+                EdgeType::Horizontal => (k, at),
+            };
+            let f = &mut self.flags[(y / self.step.1) * self.cols + x / self.step.0];
+            *f = if or { *f | bits } else { bits };
+        }
+    }
+
+    /// The §8.7.2.2 transform-block-boundary recursion of
+    /// [`transform_block_boundary`] on the sampled positions.
+    fn mark_transform_edges(
+        &mut self,
+        node: &TransformSplit,
+        (xb0, yb0): (usize, usize),
+        log2_size: u32,
+        edge_type: EdgeType,
+        filter_edge_flag: bool,
+    ) {
+        if let TransformSplit::Split(children) = node {
+            let half = 1usize << (log2_size - 1);
+            let origins = [
+                (xb0, yb0),
+                (xb0 + half, yb0),
+                (xb0, yb0 + half),
+                (xb0 + half, yb0 + half),
+            ];
+            for (child, origin) in children.iter().zip(origins) {
+                self.mark_transform_edges(
+                    child,
+                    origin,
+                    log2_size - 1,
+                    edge_type,
+                    filter_edge_flag,
+                );
+            }
+            return;
+        }
+        let size = 1usize << log2_size;
+        let (at, from) = match edge_type {
+            EdgeType::Vertical => (xb0, yb0),
+            EdgeType::Horizontal => (yb0, xb0),
+        };
+        let val = if at == 0 { filter_edge_flag } else { true };
+        let bits = if val { Self::EDGE | Self::TB } else { 0 };
+        self.mark_line(edge_type, at, from, size, bits, false);
     }
 }
 
@@ -2963,5 +3135,121 @@ mod tests {
         assert!(pic.sample(Plane::Luma, 0, 7) > 120);
         // A corner far from both seams is untouched.
         assert_eq!(pic.sample(Plane::Luma, 0, 0), 120);
+    }
+
+    /// The edge map's per-CU strengths equal the §8.7.2.2 / .3 / .4
+    /// full-grid derivation at every sampled position: every partition
+    /// (incl. AMP), CB-boundary gating, nested transform splits, intra /
+    /// coded-coefficient / motion neighbours, at a CU away from the
+    /// picture origin.
+    #[test]
+    fn edge_map_matches_full_grid_derivation() {
+        let nested = TransformSplit::Split(Box::new([
+            TransformSplit::split_once(),
+            TransformSplit::leaf(),
+            TransformSplit::Split(Box::new([
+                TransformSplit::leaf(),
+                TransformSplit::split_once(),
+                TransformSplit::leaf(),
+                TransformSplit::leaf(),
+            ])),
+            TransformSplit::leaf(),
+        ]));
+        let splits = [TransformSplit::leaf(), TransformSplit::split_once(), nested];
+        let parts = [
+            PartMode::Part2Nx2N,
+            PartMode::Part2NxN,
+            PartMode::PartNx2N,
+            PartMode::PartNxN,
+            PartMode::Part2NxnU,
+            PartMode::Part2NxnD,
+            PartMode::PartNLx2N,
+            PartMode::PartNRx2N,
+        ];
+        // A 128 × 128 field: varied motion, an intra block, coded cells.
+        let mut field = MotionField::new(128, 128);
+        for by in 0..32 {
+            for bx in 0..32 {
+                let mut c = inter_cell([(bx * 3 % 7) as i32, (by * 5 % 9) as i32], (bx / 5) as i32);
+                c.has_nonzero_coeff = (bx + by) % 3 == 0;
+                field.fill_rect(bx * 4, by * 4, 4, 4, c);
+            }
+        }
+        field.fill_rect(
+            32,
+            40,
+            8,
+            8,
+            MotionCell {
+                is_intra: true,
+                ..MotionCell::default()
+            },
+        );
+        for log2 in 3..=6u32 {
+            let n = 1usize << log2;
+            let (x_cb, y_cb) = (64, 32);
+            for (split, depth) in splits.iter().zip([0u32, 1, 3]) {
+                // Transform blocks stay at least 4 × 4.
+                if log2 < depth + 2 {
+                    continue;
+                }
+                for &part_mode in &parts {
+                    for (filter_left, filter_top) in [(true, true), (false, true), (true, false)] {
+                        let desc = DeblockCuDesc {
+                            cu: DeblockCu {
+                                x_cb,
+                                y_cb,
+                                log2_cb_size: log2,
+                                params: cu_params_420(30),
+                                qp_y_p_left: 30,
+                                qp_y_p_top: 30,
+                            },
+                            transform_split: split.clone(),
+                            part_mode,
+                            filter_left,
+                            filter_top,
+                        };
+                        let mut map = DeblockEdgeMap::new(128, 128);
+                        map.add_cu(&field, &desc);
+                        for edge_type in [EdgeType::Vertical, EdgeType::Horizontal] {
+                            let flag = match edge_type {
+                                EdgeType::Vertical => filter_left,
+                                EdgeType::Horizontal => filter_top,
+                            };
+                            let ef = derive_edge_flags(split, part_mode, log2, edge_type, flag);
+                            let bs = derive_boundary_strength(
+                                &field,
+                                x_cb,
+                                y_cb,
+                                log2,
+                                edge_type,
+                                ef.edge_flags(),
+                                ef.tb_edge(),
+                            );
+                            let (sx, sy) = match edge_type {
+                                EdgeType::Vertical => (8, 4),
+                                EdgeType::Horizontal => (4, 8),
+                            };
+                            for y in (0..n).step_by(sy) {
+                                for x in (0..n).step_by(sx) {
+                                    let got = match edge_type {
+                                        EdgeType::Vertical => map.bs_vertical(x_cb + x, y_cb + y),
+                                        EdgeType::Horizontal => {
+                                            map.bs_horizontal(x_cb + x, y_cb + y)
+                                        }
+                                    };
+                                    assert_eq!(
+                                        got,
+                                        bs.at(x, y),
+                                        "log2 {log2} {split:?} {part_mode:?} {edge_type:?} \
+                                         filter {flag} at ({x}, {y})"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

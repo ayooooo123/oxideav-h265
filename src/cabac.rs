@@ -354,12 +354,17 @@ impl<'a> CabacEngine<'a> {
 
     /// §9.3.4.3.3 — renormalization in the arithmetic decoding engine
     /// (RenormD). While `ivlCurrRange < 256`, double `ivlCurrRange` and
-    /// shift one fresh bit into `ivlOffset`.
+    /// shift one fresh bit into `ivlOffset` — done here as one shift by
+    /// the loop's iteration count and one read of that many bits.
+    #[inline]
     fn renorm(&mut self) -> Result<(), CabacError> {
-        while self.ivl_curr_range < 256 {
-            self.ivl_curr_range <<= 1;
-            let bit = self.reader.u1()? as u16;
-            self.ivl_offset = (self.ivl_offset << 1) | bit;
+        if self.ivl_curr_range < 256 {
+            // ivlCurrRange >= 2, so the count is in 1..=7: the shift that
+            // brings its leading one to bit 8.
+            let shift = self.ivl_curr_range.leading_zeros() - 7;
+            let bits = self.reader.short(shift)? as u16;
+            self.ivl_curr_range <<= shift;
+            self.ivl_offset = (self.ivl_offset << shift) | bits;
         }
         Ok(())
     }
@@ -368,10 +373,14 @@ impl<'a> CabacEngine<'a> {
     /// bin against the supplied context variable `ctx`, mutating it
     /// per the §9.3.4.3.2.2 state-transition process. Returns the
     /// decoded bin value (0 or 1).
+    #[inline]
     pub fn decode_decision(&mut self, ctx: &mut ContextModel) -> Result<u8, CabacError> {
-        // Step 1 (equations 9-64, 9-65): the LPS sub-range.
+        // Step 1 (equations 9-64, 9-65): the LPS sub-range. pStateIdx
+        // stays within 0..=63 (Table 9-53), so the mask only drops a
+        // bounds check.
+        let state = usize::from(ctx.p_state_idx) & 63;
         let q_range_idx = ((self.ivl_curr_range >> 6) & 3) as usize;
-        let ivl_lps_range = RANGE_TAB_LPS[ctx.p_state_idx as usize][q_range_idx] as u16;
+        let ivl_lps_range = RANGE_TAB_LPS[state][q_range_idx] as u16;
 
         // Step 2: subtract the LPS range; compare ivlOffset.
         self.ivl_curr_range -= ivl_lps_range;
@@ -388,12 +397,12 @@ impl<'a> CabacEngine<'a> {
 
         // §9.3.4.3.2.2 state transition (equation 9-66).
         if bin_val == ctx.val_mps {
-            ctx.p_state_idx = TRANS_IDX_MPS[ctx.p_state_idx as usize];
+            ctx.p_state_idx = TRANS_IDX_MPS[state];
         } else {
-            if ctx.p_state_idx == 0 {
+            if state == 0 {
                 ctx.val_mps = 1 - ctx.val_mps;
             }
-            ctx.p_state_idx = TRANS_IDX_LPS[ctx.p_state_idx as usize];
+            ctx.p_state_idx = TRANS_IDX_LPS[state];
         }
 
         // §9.3.4.3.3 renormalization.
@@ -404,8 +413,9 @@ impl<'a> CabacEngine<'a> {
     /// §9.3.4.3.4 — DecodeBypass: decode one equal-probability bin.
     /// Doubles `ivlOffset` (shifting in one fresh bit), then compares
     /// against `ivlCurrRange`. Returns the decoded bin (0 or 1).
+    #[inline]
     pub fn decode_bypass(&mut self) -> Result<u8, CabacError> {
-        let bit = self.reader.u1()? as u16;
+        let bit = self.reader.short(1)? as u16;
         self.ivl_offset = (self.ivl_offset << 1) | bit;
         if self.ivl_offset >= self.ivl_curr_range {
             self.ivl_offset -= self.ivl_curr_range;

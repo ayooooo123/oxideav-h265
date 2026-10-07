@@ -369,15 +369,29 @@ pub(crate) struct SaoSource<'a> {
     pub(crate) y_origin: usize,
 }
 
-impl SaoSource<'_> {
+impl<'a> SaoSource<'a> {
     #[inline]
     fn at(&self, x: usize, y: usize) -> i32 {
         i32::from(self.buf[(y - self.y_origin) * self.stride + x])
+    }
+
+    /// Plane row `y` of the source.
+    #[inline]
+    fn row(&self, y: usize) -> &'a [u16] {
+        let o = (y - self.y_origin) * self.stride;
+        &self.buf[o..o + self.stride]
     }
 }
 
 /// §8.7.3.2 for one CTB of one component: classify from `src` (the
 /// pre-SAO samples), write the offset samples into `dst`.
+///
+/// Edge-offset neighbours can leave the CTB only from its border rows
+/// (classes with a vertical component) or border columns (a horizontal
+/// one). Those samples take the picture / slice / tile tests; interior
+/// samples, and every band-offset sample, are computed over whole row
+/// spans with the same equations. A PCM / bypass suppression map
+/// sends every sample through the per-sample form.
 #[allow(clippy::too_many_arguments)]
 fn sao_ctb_core(
     src: SaoSource<'_>,
@@ -403,98 +417,263 @@ fn sao_ctb_core(
     let (pw, ph) = (geom.pw, geom.ph);
     let w = n_w.min(pw.saturating_sub(x_ctb));
     let h = n_h.min(ph.saturating_sub(y_ctb));
+    // Samples of at most 14 bits plus offsets of at most 1023 fit `i16`
+    // lanes throughout.
+    let narrow = geom.bit_depth <= 14 && comp.offset_val.iter().all(|o| o.abs() <= 1023);
 
     if comp.sao_type_idx == 2 {
         // §8.7.3.2 edge offset (equations 8-409..8-413).
         let (h0, v0, h1, v1) = eo_pos(comp.eo_class);
         let (sw, sh) = geom.sub;
-        // A neighbour leaves the CTB only from its border rows (when
-        // the class has a vertical component) / border columns (a
-        // horizontal one); interior samples skip the picture / slice /
-        // tile tests entirely.
         let vertical = v0 != 0 || v1 != 0;
         let horizontal = h0 != 0 || h1 != 0;
+        // SaoOffsetVal indexed directly by 2 + Sign + Sign: equation
+        // 8-412 maps edgeIdx 0, 1, 2 to 1, 2, 0.
+        let off = &comp.offset_val;
+        let by_edge = [off[1], off[2], off[0], off[3], off[4]];
+        // One sample with every §8.7.3.2 test (border samples and the
+        // suppression-map case).
+        let checked = |i: usize, ysj: usize, border_row: bool, d: &mut u16| {
+            let xsi = x_ctb + i;
+            let border_col = horizontal && (i == 0 || i + 1 == w);
+            if border_row || border_col {
+                let n0x = xsi as i64 + i64::from(h0);
+                let n0y = ysj as i64 + i64::from(v0);
+                let n1x = xsi as i64 + i64::from(h1);
+                let n1y = ysj as i64 + i64::from(v1);
+                // §8.7.3.2: a neighbour outside the picture forces
+                // edgeIdx = 0 (no offset).
+                let in_pic =
+                    |x: i64, y: i64| x >= 0 && y >= 0 && (x as usize) < pw && (y as usize) < ph;
+                if !in_pic(n0x, n0y) || !in_pic(n1x, n1y) {
+                    return;
+                }
+                // §8.7.3.2: a neighbour in a different slice / tile with
+                // loop filtering across that boundary disabled also
+                // forces edgeIdx = 0. Positions map to luma space for
+                // the CTB-grid lookup.
+                if let Some(b) = boundaries {
+                    let (lx, ly) = (xsi * sw, ysj * sh);
+                    if !b.neighbour_allowed(lx, ly, n0x as usize * sw, n0y as usize * sh)
+                        || !b.neighbour_allowed(lx, ly, n1x as usize * sw, n1y as usize * sh)
+                    {
+                        return;
+                    }
+                }
+            }
+            let cur = src.at(xsi, ysj);
+            let s0 = src.at(
+                (xsi as i64 + i64::from(h0)) as usize,
+                (ysj as i64 + i64::from(v0)) as usize,
+            );
+            let s1 = src.at(
+                (xsi as i64 + i64::from(h1)) as usize,
+                (ysj as i64 + i64::from(v1)) as usize,
+            );
+            // equation 8-413, after the §8.7.3.1 PCM / bypass suppression.
+            if no_filter.is_some() && suppressed(xsi, ysj) {
+                return;
+            }
+            let edge = 2 + sign(cur - s0) + sign(cur - s1);
+            *d = (cur + by_edge[edge as usize]).clamp(0, max) as u16;
+        };
+        // Columns whose neighbours stay inside the CTB's column.
+        let (lo, hi) = if horizontal {
+            (1, w.saturating_sub(1).max(1))
+        } else {
+            (0, w)
+        };
+        let n = hi.min(w).saturating_sub(lo);
         for j in 0..h {
             let ysj = y_ctb + j;
             let border_row = vertical && (j == 0 || j + 1 == h);
             let dr = ysj - dst_y_origin;
             let drow = &mut dst[dr * dst_stride + x_ctb..dr * dst_stride + x_ctb + w];
-            for (i, d) in drow.iter_mut().enumerate() {
-                let xsi = x_ctb + i;
-                let border_col = horizontal && (i == 0 || i + 1 == w);
-                if border_row || border_col {
-                    let n0x = xsi as i64 + i64::from(h0);
-                    let n0y = ysj as i64 + i64::from(v0);
-                    let n1x = xsi as i64 + i64::from(h1);
-                    let n1y = ysj as i64 + i64::from(v1);
-                    // §8.7.3.2: a neighbour outside the picture forces
-                    // edgeIdx = 0 (no offset).
-                    let in_pic =
-                        |x: i64, y: i64| x >= 0 && y >= 0 && (x as usize) < pw && (y as usize) < ph;
-                    if !in_pic(n0x, n0y) || !in_pic(n1x, n1y) {
-                        continue;
-                    }
-                    // §8.7.3.2: a neighbour in a different slice / tile
-                    // with loop filtering across that boundary disabled
-                    // also forces edgeIdx = 0. Positions map to luma
-                    // space for the CTB-grid lookup.
-                    if let Some(b) = boundaries {
-                        let (lx, ly) = (xsi * sw, ysj * sh);
-                        if !b.neighbour_allowed(lx, ly, n0x as usize * sw, n0y as usize * sh)
-                            || !b.neighbour_allowed(lx, ly, n1x as usize * sw, n1y as usize * sh)
-                        {
-                            continue;
-                        }
-                    }
+            if no_filter.is_some() {
+                for (i, d) in drow.iter_mut().enumerate() {
+                    checked(i, ysj, border_row, d);
                 }
-                let cur = src.at(xsi, ysj);
-                let s0 = src.at(
-                    (xsi as i64 + i64::from(h0)) as usize,
-                    (ysj as i64 + i64::from(v0)) as usize,
-                );
-                let s1 = src.at(
-                    (xsi as i64 + i64::from(h1)) as usize,
-                    (ysj as i64 + i64::from(v1)) as usize,
-                );
-                // equation 8-411.
-                let mut edge_idx = 2 + sign(cur - s0) + sign(cur - s1);
-                // equation 8-412.
-                if edge_idx == 0 || edge_idx == 1 || edge_idx == 2 {
-                    edge_idx = if edge_idx == 2 { 0 } else { edge_idx + 1 };
+                continue;
+            }
+            // The interior columns' neighbours share their CTB: this one,
+            // or on a border row the CTB above / below. Their picture and
+            // slice / tile tests therefore agree along the row; a failed
+            // test leaves the span unmodified (edgeIdx = 0).
+            let rows_allowed = !border_row
+                || [v0, v1].into_iter().all(|dy| {
+                    let ny = ysj as i64 + i64::from(dy);
+                    ny >= 0
+                        && (ny as usize) < ph
+                        && boundaries.map_or(true, |b| {
+                            let (lx, ly) = (x_ctb * sw, ysj * sh);
+                            b.neighbour_allowed(lx, ly, lx, ny as usize * sh)
+                        })
+                });
+            if rows_allowed {
+                let x = x_ctb + lo;
+                let near = |dy: i32, dx: i32| {
+                    let row = src.row((ysj as i64 + i64::from(dy)) as usize);
+                    let start = (x as i64 + i64::from(dx)) as usize;
+                    &row[start..start + n]
+                };
+                let (cur, a, b) = (near(0, 0), near(v0, h0), near(v1, h1));
+                let span = &mut drow[lo..lo + n];
+                if narrow {
+                    edge_span::<i16>(span, cur, a, b, by_edge, max);
+                } else {
+                    edge_span::<i32>(span, cur, a, b, by_edge, max);
                 }
-                // equation 8-413.
-                if no_filter.is_some() && suppressed(xsi, ysj) {
-                    continue; // §8.7.3.1 PCM / bypass suppression
-                }
-                let off = comp.offset_val[edge_idx as usize];
-                *d = (cur + off).clamp(0, max) as u16;
+            }
+            for i in (0..lo).chain(lo + n..w) {
+                checked(i, ysj, border_row, &mut drow[i]);
             }
         }
     } else {
-        // §8.7.3.2 band offset (equations 8-414..8-415).
-        let band_shift = i32::from(geom.bit_depth) - 5;
-        let sao_left_class = i32::from(comp.band_position);
-        // equation 8-414: bandTable maps four consecutive bands to 1..=4.
-        let mut band_table = [0usize; 32];
-        for k in 0..4i32 {
-            band_table[((k + sao_left_class) & 31) as usize] = (k + 1) as usize;
-        }
+        // §8.7.3.2 band offset (equations 8-414..8-415): bandTable maps
+        // the four consecutive bands from sao_left_class to SaoOffsetVal
+        // 1..=4; every other band takes SaoOffsetVal[ 0 ].
+        let band_shift = u32::from(geom.bit_depth) - 5;
+        let left_class = u32::from(comp.band_position);
+        let bands: [u32; 4] = core::array::from_fn(|k| (k as u32 + left_class) & 31);
+        let off = &comp.offset_val;
         for j in 0..h {
             let ysj = y_ctb + j;
             let dr = ysj - dst_y_origin;
             let drow = &mut dst[dr * dst_stride + x_ctb..dr * dst_stride + x_ctb + w];
-            for (i, d) in drow.iter_mut().enumerate() {
-                let xsi = x_ctb + i;
-                if no_filter.is_some() && suppressed(xsi, ysj) {
-                    continue; // §8.7.3.1 PCM / bypass suppression
+            let cur = &src.row(ysj)[x_ctb..x_ctb + w];
+            if no_filter.is_some() {
+                for i in 0..w {
+                    if suppressed(x_ctb + i, ysj) {
+                        continue; // §8.7.3.1 PCM / bypass suppression
+                    }
+                    let one = i..i + 1;
+                    band_span::<i32>(
+                        &mut drow[one.clone()],
+                        &cur[one],
+                        band_shift,
+                        bands,
+                        off,
+                        max,
+                    );
                 }
-                let cur = src.at(xsi, ysj);
-                let band_idx = band_table[(cur >> band_shift) as usize];
-                // equation 8-415.
-                let off = comp.offset_val[band_idx];
-                *d = (cur + off).clamp(0, max) as u16;
+            } else if narrow {
+                band_span::<i16>(drow, cur, band_shift, bands, off, max);
+            } else {
+                band_span::<i32>(drow, cur, band_shift, bands, off, max);
             }
         }
+    }
+}
+
+/// Integer lanes for the §8.7.3.2 sample arithmetic: `i16` when the
+/// samples and offsets fit it (twice the vector lanes), else `i32`.
+trait SaoLane:
+    Copy
+    + Ord
+    + core::ops::Add<Output = Self>
+    + core::ops::Sub<Output = Self>
+    + core::ops::Shr<u32, Output = Self>
+{
+    /// `v` in this lane type (exact for every value the caller passes).
+    fn lane(v: i32) -> Self;
+    /// A clamped result back to a sample.
+    fn sample(self) -> u16;
+}
+
+impl SaoLane for i16 {
+    #[inline(always)]
+    fn lane(v: i32) -> Self {
+        v as i16
+    }
+    #[inline(always)]
+    fn sample(self) -> u16 {
+        self as u16
+    }
+}
+
+impl SaoLane for i32 {
+    #[inline(always)]
+    fn lane(v: i32) -> Self {
+        v
+    }
+    #[inline(always)]
+    fn sample(self) -> u16 {
+        self as u16
+    }
+}
+
+/// §8.7.3.2 edge offset over a row span whose neighbours `a` / `b` all
+/// lie inside the picture and may be read: equations 8-411 .. 8-413,
+/// with `by_edge[ 2 + Sign( c − a ) + Sign( c − b ) ]` the offset.
+#[inline(always)]
+fn edge_span<L: SaoLane>(
+    span: &mut [u16],
+    cur: &[u16],
+    a: &[u16],
+    b: &[u16],
+    by_edge: [i32; 5],
+    max: i32,
+) {
+    let [t0, t1, t2, t3, t4] = by_edge.map(L::lane);
+    let (zero, one, max) = (L::lane(0), L::lane(1), L::lane(max));
+    let (minus_two, minus_one) = (L::lane(-2), L::lane(-1));
+    let sign = |x: L, y: L| {
+        if x > y {
+            one
+        } else if x < y {
+            minus_one
+        } else {
+            zero
+        }
+    };
+    for (((d, &c), &a), &b) in span.iter_mut().zip(cur).zip(a).zip(b) {
+        let (c, a, b) = (L::lane(c.into()), L::lane(a.into()), L::lane(b.into()));
+        let s = sign(c, a) + sign(c, b);
+        let o = if s == minus_two {
+            t0
+        } else if s == minus_one {
+            t1
+        } else if s == zero {
+            t2
+        } else if s == one {
+            t3
+        } else {
+            t4
+        };
+        *d = (c + o).clamp(zero, max).sample();
+    }
+}
+
+/// §8.7.3.2 band offset over a row span (equations 8-414 / 8-415): the
+/// sample's band `c >> bandShift` among `bands` selects SaoOffsetVal
+/// 1..=4, any other band SaoOffsetVal[ 0 ].
+#[inline(always)]
+fn band_span<L: SaoLane>(
+    span: &mut [u16],
+    cur: &[u16],
+    band_shift: u32,
+    bands: [u32; 4],
+    off: &[i32; 5],
+    max: i32,
+) {
+    let [b0, b1, b2, b3] = bands.map(|b| L::lane(b as i32));
+    let [o0, o1, o2, o3, o4] = off.map(L::lane);
+    let (zero, max) = (L::lane(0), L::lane(max));
+    for (d, &c) in span.iter_mut().zip(cur) {
+        let c = L::lane(c.into());
+        let band = c >> band_shift;
+        let o = if band == b0 {
+            o1
+        } else if band == b1 {
+            o2
+        } else if band == b2 {
+            o3
+        } else if band == b3 {
+            o4
+        } else {
+            o0
+        };
+        *d = (c + o).clamp(zero, max).sample();
     }
 }
 

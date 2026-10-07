@@ -25,8 +25,8 @@ use oxideav_core::{
 use crate::hvcc::{
     extradata_is_hvcc, extradata_is_lhvc, parse_hvcc_with_len, parse_lhvc, split_length_prefixed,
 };
-use crate::picture::{Picture, Plane};
-use crate::sequence::{DecodedFrame, LayerTarget, SequenceDecoder};
+use crate::picture::{sub_wh_c, Picture, Plane};
+use crate::sequence::{CropWindow, DecodedFrame, LayerTarget, SequenceDecoder};
 
 /// The default reorder depth when no SPS has been activated yet (the
 /// §7.4.3.2.1 `sps_max_num_reorder_pics` bound once one has).
@@ -177,24 +177,29 @@ impl H265Decoder {
                 .map_or(DEFAULT_REORDER, |n| n as usize)
                 * layers_out
         };
+        // Released planes are kept for the next pictures while decoding
+        // continues; a flush ends the stream, so they are freed as soon
+        // as they are packed.
+        let recycle = !flush;
         while self.reorder.len() > depth {
             let f = self.reorder.remove(0);
             if !f.output {
+                if recycle {
+                    for plane in f.picture.into_shared_planes() {
+                        self.seq.recycle_plane(plane);
+                    }
+                }
                 continue;
             }
             let pts = self.pts_queue.pop().map(|r| r.0);
-            // §7.4.3.2.1 — output the conformance-cropped picture. The
-            // frame owns its planes when the DPB no longer shares them
-            // (a still, or a picture already unmarked), so the packing
-            // consumes them plane by plane instead of holding a second
-            // whole-picture copy.
-            let picture = if f.crop.is_whole(&f.picture) {
-                f.picture
-            } else {
-                f.output_picture()
-            };
-            self.ready
-                .push_back(Frame::Video(video_frame_owned(picture, pts)));
+            // §7.4.3.2.1 — output the conformance-cropped picture,
+            // packed straight from the decoded planes.
+            let frame = video_frame_owned(f.picture, &f.crop, pts, |plane| {
+                if recycle {
+                    self.seq.recycle_plane(plane);
+                }
+            });
+            self.ready.push_back(Frame::Video(frame));
         }
     }
 }
@@ -265,37 +270,73 @@ impl Decoder for H265Decoder {
     }
 }
 
-/// Pack a reconstructed [`Picture`] into a [`VideoFrame`] (8-bit planes
-/// as one byte per sample; higher bit depths as little-endian 16-bit,
-/// the planar `p010le`-family layout), consuming the picture so each
-/// source plane is freed as soon as it is packed.
-fn video_frame_owned(pic: Picture, pts: Option<i64>) -> VideoFrame {
+/// Pack the §7.4.3.2.1 conformance-cropped window of a reconstructed
+/// [`Picture`] into a [`VideoFrame`] (8-bit planes as one byte per
+/// sample; higher bit depths as little-endian 16-bit, the planar
+/// `p010le`-family layout). The window is clamped to the coded picture
+/// as [`Picture::cropped`] does and read straight from the decoded
+/// planes. Each plane buffer is handed to `release` as soon as it is
+/// packed.
+fn video_frame_owned(
+    pic: Picture,
+    crop: &CropWindow,
+    pts: Option<i64>,
+    mut release: impl FnMut(std::sync::Arc<Vec<u16>>),
+) -> VideoFrame {
     let chroma = pic.chroma_array_type() != 0;
     let wide = pic.bit_depth(Plane::Luma) > 8 || (chroma && pic.bit_depth(Plane::Cb) > 8);
-    let dims = [
-        pic.plane_dims(Plane::Luma),
-        pic.plane_dims(Plane::Cb),
-        pic.plane_dims(Plane::Cr),
-    ];
-    let (y, cb, cr) = pic.into_planes();
-    let sources = if chroma {
-        vec![(y, dims[0]), (cb, dims[1]), (cr, dims[2])]
-    } else {
-        vec![(y, dims[0])]
-    };
-    let mut out = Vec::with_capacity(sources.len());
-    for (buf, (w, h)) in sources {
-        let n = w * h;
-        let (stride, data) = if wide {
-            let mut data = Vec::with_capacity(n * 2);
-            for &v in buf.iter().take(n) {
-                data.extend_from_slice(&v.to_le_bytes());
+    let (lw, lh) = pic.plane_dims(Plane::Luma);
+    let (x0, y0) = (crop.x0.min(lw), crop.y0.min(lh));
+    let (w, h) = (crop.width.min(lw - x0), crop.height.min(lh - y0));
+    // (x, y, width, height, plane stride) per packed plane.
+    let mut windows = vec![(x0, y0, w, h, lw)];
+    if chroma {
+        let (sw, sh) = sub_wh_c(pic.chroma_array_type());
+        let window = (
+            x0 / sw,
+            y0 / sh,
+            w / sw,
+            h / sh,
+            pic.plane_dims(Plane::Cb).0,
+        );
+        windows.extend([window, window]);
+    }
+    let mut out = Vec::with_capacity(windows.len());
+    for (buf, (x, y, w, h, stride)) in pic.into_shared_planes().into_iter().zip(windows) {
+        let rows = h.min((buf.len() / stride.max(1)).saturating_sub(y));
+        let row = |r: usize| &buf[(y + r) * stride + x..(y + r) * stride + x + w];
+        let (stride, data) = if w == 0 {
+            (0, Vec::new())
+        } else if wide {
+            let mut data = vec![0u8; w * rows * 2];
+            for (r, dst) in data.chunks_exact_mut(w * 2).enumerate() {
+                let src = row(r);
+                let mut dst8 = dst.chunks_exact_mut(16);
+                let mut src8 = src.chunks_exact(8);
+                for (d, s) in (&mut dst8).zip(&mut src8) {
+                    let d: &mut [u8; 16] = d.try_into().unwrap();
+                    let s: &[u16; 8] = s.try_into().unwrap();
+                    for (pair, &v) in d.chunks_exact_mut(2).zip(s) {
+                        pair.copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+                for (d, &v) in dst8
+                    .into_remainder()
+                    .chunks_exact_mut(2)
+                    .zip(src8.remainder())
+                {
+                    d.copy_from_slice(&v.to_le_bytes());
+                }
             }
             (w * 2, data)
         } else {
-            (w, buf.iter().take(n).map(|&v| v as u8).collect())
+            let mut data = Vec::with_capacity(w * rows);
+            for r in 0..rows {
+                data.extend(row(r).iter().map(|&v| v as u8));
+            }
+            (w, data)
         };
-        drop(buf);
+        release(buf);
         out.push(VideoPlane { stride, data });
     }
     VideoFrame { pts, planes: out }

@@ -224,23 +224,81 @@ impl std::error::Error for ScanOrderError {}
 /// for the traverse scan; an out-of-range `log2_block_size` yields
 /// [`ScanOrderError::Log2BlockSizeOutOfRange`].
 pub fn scan_order(log2_block_size: u8, scan_idx: ScanIdx) -> Result<Vec<ScanPos>, ScanOrderError> {
-    let in_range = match scan_idx {
+    scan_order_table(log2_block_size, scan_idx).map(<[ScanPos]>::to_vec)
+}
+
+/// Whether §7.4.2 populates `ScanOrder[ log2BlockSize ][ scanIdx ]`.
+fn populated(scan_idx: ScanIdx, log2_block_size: u8) -> bool {
+    match scan_idx {
         ScanIdx::Diagonal | ScanIdx::Horizontal | ScanIdx::Vertical => log2_block_size <= 3,
         ScanIdx::Traverse => (2..=5).contains(&log2_block_size),
-    };
-    if !in_range {
+    }
+}
+
+/// The §7.4.2 `ScanOrder` table, `[ scanIdx ][ log2BlockSize ]`, built on
+/// first use; empty where §7.4.2 leaves it unpopulated.
+static SCAN_ORDER: std::sync::LazyLock<[[Vec<ScanPos>; 6]; 4]> = std::sync::LazyLock::new(|| {
+    [
+        ScanIdx::Diagonal,
+        ScanIdx::Horizontal,
+        ScanIdx::Vertical,
+        ScanIdx::Traverse,
+    ]
+    .map(|scan_idx| {
+        core::array::from_fn(|log2| {
+            if !populated(scan_idx, log2 as u8) {
+                return Vec::new();
+            }
+            let blk_size = 1usize << log2;
+            match scan_idx {
+                ScanIdx::Diagonal => up_right_diagonal(blk_size),
+                ScanIdx::Horizontal => horizontal(blk_size),
+                ScanIdx::Vertical => vertical(blk_size),
+                ScanIdx::Traverse => traverse(blk_size),
+            }
+        })
+    })
+});
+
+/// [`scan_order`] borrowed from the once-built §7.4.2 table.
+pub(crate) fn scan_order_table(
+    log2_block_size: u8,
+    scan_idx: ScanIdx,
+) -> Result<&'static [ScanPos], ScanOrderError> {
+    if !populated(scan_idx, log2_block_size) {
         return Err(ScanOrderError::Log2BlockSizeOutOfRange {
             scan_idx,
             log2_block_size,
         });
     }
-    let blk_size = 1usize << log2_block_size;
-    Ok(match scan_idx {
-        ScanIdx::Diagonal => up_right_diagonal(blk_size),
-        ScanIdx::Horizontal => horizontal(blk_size),
-        ScanIdx::Vertical => vertical(blk_size),
-        ScanIdx::Traverse => traverse(blk_size),
+    Ok(&SCAN_ORDER[usize::from(scan_idx.index())][usize::from(log2_block_size)])
+}
+
+/// The inverse of each populated §7.4.2 `ScanOrder` entry: the scan
+/// position `sPos` of cell `( x, y )`, stored at `y * blkSize + x`.
+static SCAN_POSITION: std::sync::LazyLock<[[Vec<u16>; 6]; 4]> = std::sync::LazyLock::new(|| {
+    core::array::from_fn(|idx| {
+        core::array::from_fn(|log2| {
+            let order = &SCAN_ORDER[idx][log2];
+            let blk_size = 1usize << log2;
+            let mut position = vec![0u16; order.len()];
+            for (s_pos, p) in order.iter().enumerate() {
+                position[usize::from(p.y) * blk_size + usize::from(p.x)] = s_pos as u16;
+            }
+            position
+        })
     })
+});
+
+/// The scan position of each cell of `ScanOrder[ log2BlockSize ][
+/// scanIdx ]`, indexed `y * ( 1 << log2BlockSize ) + x`: the same
+/// validity rule as [`scan_order`].
+pub(crate) fn scan_position_table(
+    log2_block_size: u8,
+    scan_idx: ScanIdx,
+) -> Result<&'static [u16], ScanOrderError> {
+    scan_order_table(log2_block_size, scan_idx)?;
+    Ok(&SCAN_POSITION[usize::from(scan_idx.index())][usize::from(log2_block_size)])
 }
 
 #[cfg(test)]
