@@ -67,21 +67,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- A P or B picture whose reference was decoded under a replaced SPS of
-  another bit depth or chroma format is now a decode error. Before, the
-  reference's samples were read at the current bit depth: in an 8-bit
-  picture, 10-bit samples overflowed the 16-bit interpolation sums (a panic
-  with overflow checks, wrapped samples without), with either kernel set.
+- A picture that activates a changed SPS (another id, or the same id
+  re-sent with other bytes) now first marks its layer's reference pictures
+  unused, as FFmpeg does; re-sending the same bytes keeps them. A P or B
+  picture whose RPS still names a picture coded under the old SPS now
+  fails with `ReconError::MissingReference` (FFmpeg 9.0.2 also drops it:
+  "Could not find ref with POC"), where before it predicted from a picture
+  of another size or bit depth. A missing used reference was reported as
+  `InterNotSupported` ("not reconstructed by the intra path") before.
+- A used reference picture must also have the current picture's chroma
+  format and bit depths, or prediction fails with
+  `InterPredError::ReferenceFormatMismatch`. Before, a 10-bit reference of
+  an 8-bit picture overflowed the 16-bit interpolation sums (a panic with
+  overflow checks, wrapped samples without), with either kernel set.
 - `log2_sao_offset_scale_luma` / `_chroma` above `Max( 0, BitDepth − 10 )`
   of the active SPS are now a decode error, as FFmpeg rejects them. Before,
   a scale of 31 made an offset of 1 `i32::MIN`: with overflow checks the
   16-bit SAO lane test panicked, and without them the offset entered those
   lanes and was truncated to 0. That lane test is now a range test, so a
   directly supplied offset outside `−1023..=1023` takes the 32-bit path.
-- `tests/hostile_parameter_sets.rs` decodes both cases end to end (an
-  8-bit SPS, PPS and P slice after a 10-bit IDR; PPS scales of 1 and 31 on
-  an 8-bit stream) with both kernel sets and requires an error; a re-sent
-  unchanged SPS and in-range scales still decode exactly.
+- `tests/hostile_parameter_sets.rs` decodes these cases with both kernel
+  sets and requires an error: an 8-bit SPS, PPS and P slice after a 10-bit
+  IDR or after a 32×32 IDR of the same format; PPS SAO scales of 1 and 31
+  on an 8-bit stream. An unchanged re-sent SPS and in-range scales still
+  decode exactly.
 
 ## [0.0.14](https://github.com/OxideAV/oxideav-h265/compare/v0.0.13...v0.0.14) - 2026-10-01
 

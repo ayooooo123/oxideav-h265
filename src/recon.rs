@@ -56,6 +56,10 @@ pub enum ReconError {
     /// The decoded CTU carried an inter prediction unit, which the intra
     /// reconstruction path does not handle.
     InterNotSupported,
+    /// A used reference list entry is the §8.3.2 "no reference picture":
+    /// the RPS names a picture the DPB does not hold (never decoded, or
+    /// cleared when the active SPS changed).
+    MissingReference,
     /// The §6.4.1 picture-tiling geometry needed for neighbour
     /// availability could not be built.
     Tiling(crate::availability::AvailabilityError),
@@ -69,6 +73,9 @@ impl core::fmt::Display for ReconError {
             Self::InterPred(e) => write!(f, "inter prediction failed: {e}"),
             Self::InterNotSupported => {
                 f.write_str("inter prediction is not reconstructed by the intra path")
+            }
+            Self::MissingReference => {
+                f.write_str("reference picture is missing (the RPS names no picture in the DPB)")
             }
             Self::Tiling(e) => write!(f, "picture tiling geometry invalid: {e}"),
         }

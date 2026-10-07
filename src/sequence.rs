@@ -378,6 +378,8 @@ struct LayerState {
     initialized: bool,
     /// `PocDecrementedInDPBFlag[ nuh_layer_id ]`.
     poc_decremented: bool,
+    /// The identity of the SPS the layer's last picture activated.
+    active_sps: Option<u64>,
 }
 
 /// The access unit being assembled (F.7.4.2.4.4).
@@ -403,6 +405,14 @@ struct AccessUnit {
 pub struct SequenceDecoder {
     vps: BTreeMap<u8, HevcVps>,
     sps: BTreeMap<u8, SeqParameterSet>,
+    /// The NAL unit bytes each stored SPS was parsed from (header fields,
+    /// RBSP without trailing zero bytes) and the identity an activation
+    /// compares: re-sending those bytes keeps the stored SPS and its
+    /// identity (FFmpeg ps.c `compare_sps`); other bytes under the same id
+    /// replace it with a new identity.
+    sps_source: BTreeMap<u8, (Vec<u8>, u64)>,
+    /// The last SPS identity handed out.
+    sps_identities: u64,
     pps: BTreeMap<u8, PicParameterSet>,
     state: PictureSequenceState,
     frames: Vec<DecodedFrame>,
@@ -686,7 +696,25 @@ impl SequenceDecoder {
                     header.nuh_layer_id,
                     self.vps.get(&vps_id),
                 )?;
-                self.sps.insert(sps.sps_id, sps);
+                // FFmpeg ps.c `compare_sps`: a repeat of the stored SPS's
+                // bytes keeps the stored SPS (and the identity activation
+                // compares); other bytes replace it under a new identity.
+                let payload = rbsp
+                    .iter()
+                    .rposition(|&b| b != 0)
+                    .map_or(0, |last| last + 1);
+                let mut source = vec![header.nuh_layer_id, header.temporal_id];
+                source.extend_from_slice(&rbsp[..payload]);
+                if self
+                    .sps_source
+                    .get(&sps.sps_id)
+                    .map_or(true, |(stored, _)| *stored != source)
+                {
+                    self.sps_identities += 1;
+                    self.sps_source
+                        .insert(sps.sps_id, (source, self.sps_identities));
+                    self.sps.insert(sps.sps_id, sps);
+                }
                 self.plan = None;
             }
             NAL_PPS => {
@@ -823,6 +851,24 @@ impl SequenceDecoder {
         }
 
         let geom = Geometry::derive(sps, pps)?;
+
+        // FFmpeg hevcdec.c `hevc_frame_start`: a picture activating another
+        // SPS than its layer's active one (another id, or the id re-sent
+        // with other bytes) first marks every reference picture of the
+        // layer unused (`ff_hevc_clear_refs`). An RPS still naming a
+        // picture coded under the old SPS then finds "no reference
+        // picture", and the picture fails as in FFmpeg (refs.c
+        // `add_candidate_ref`) instead of predicting from a picture of
+        // another size or format.
+        let identity = self.sps_source.get(&pps.sps_id).map(|&(_, id)| id);
+        let layer = self.layers.entry(layer_id).or_default();
+        if layer
+            .active_sps
+            .is_some_and(|active| Some(active) != identity)
+        {
+            self.state.dpb_mut().unmark_layer(layer_id);
+        }
+        layer.active_sps = identity;
 
         // §C.5.2.2 — pictures the previous picture's RPS left "unused
         // for reference" leave the DPB (output goes through

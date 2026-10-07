@@ -6,7 +6,7 @@
 
 mod fixture_bytes;
 
-use fixture_bytes::{I_THEN_P_HEVC, MAIN10_HEVC};
+use fixture_bytes::{I_THEN_P_HEVC, MAIN10_HEVC, QP_HIGH_HEVC};
 use oxideav_h265::encoder::bitwriter::BitWriter;
 use oxideav_h265::encoder::nal::{annexb, nal_unit};
 use oxideav_h265::nal::{collect_nal_units, NalUnit};
@@ -80,33 +80,66 @@ fn pick(units: &[NalUnit], types: &[u8]) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// The 10-bit IDR of one stream, then the 8-bit SPS, PPS and P slice of
-/// another: the replaced SPS (same id) leaves the 10-bit picture in the
-/// DPB, and the P slice's RPS names its POC 0. The control re-sends the
-/// 8-bit stream's own SPS and PPS before its P slice instead.
+/// The IDR of `first`, then the SPS, PPS and P slice of the 64×64 8-bit
+/// `I_THEN_P_HEVC`: its SPS (same id) follows `first`'s, and the P slice's
+/// RPS names POC 0, the picture coded under `first`'s SPS.
+fn retained_across_an_sps_change(first: &[u8]) -> Vec<u8> {
+    let first = units(first);
+    let idr = first
+        .iter()
+        .find(|u| matches!(u.header.nal_unit_type, IDR_W_RADL | IDR_N_LP))
+        .map(|u| u.header.nal_unit_type)
+        .expect("fixture IDR");
+    let mut stream = pick(&first, &[VPS, SPS, PPS, idr]);
+    stream.extend(pick(&units(I_THEN_P_HEVC), &[SPS, PPS, TRAIL_R]));
+    annexb(&stream)
+}
+
+/// As in FFmpeg, activating a changed SPS clears the layer's references
+/// (hevcdec.c `hevc_frame_start`, `ff_hevc_clear_refs`), so the P picture
+/// whose RPS names the old picture finds no reference and fails (refs.c
+/// `add_candidate_ref`: "Could not find ref with POC 0"; FFmpeg 9.0.2
+/// outputs the IDR and drops the P picture of both streams). Neither
+/// reaches prediction from the stale picture.
+fn assert_reference_missing(stream: &[u8], what: &str) {
+    for result in decode_both(stream) {
+        let error = result.expect_err(what);
+        assert!(
+            error.contains("reference picture is missing"),
+            "{what}: {error}"
+        );
+    }
+}
+
+/// A 10-bit picture kept across an 8-bit SPS: predicting from it read its
+/// samples through 8-bit lanes before the format guard.
 #[test]
 fn a_reference_retained_across_an_sps_of_another_bit_depth_is_a_decode_error() {
-    let ten = units(MAIN10_HEVC);
-    let eight = units(I_THEN_P_HEVC);
-    let idr = |u: &[NalUnit]| {
-        u.iter()
-            .find(|u| matches!(u.header.nal_unit_type, IDR_W_RADL | IDR_N_LP))
-            .map(|u| u.header.nal_unit_type)
-            .expect("fixture IDR")
-    };
-    let mut spliced = pick(&ten, &[VPS, SPS, PPS, idr(&ten)]);
-    spliced.extend(pick(&eight, &[SPS, PPS, TRAIL_R]));
-    for result in decode_both(&annexb(&spliced)) {
-        let error = result.expect_err("an 8-bit P picture predicted from a 10-bit reference");
-        assert!(error.contains("reference picture"), "{error}");
-    }
+    assert_reference_missing(
+        &retained_across_an_sps_change(MAIN10_HEVC),
+        "an 8-bit P picture naming a 10-bit picture",
+    );
+}
 
-    let mut resent = pick(&eight, &[VPS, SPS, PPS, idr(&eight)]);
-    resent.extend(pick(&eight, &[SPS, PPS, TRAIL_R]));
+/// A 32×32 picture of the same format kept across a 64×64 SPS: the format
+/// guard admits it, and predicting from it read a picture of another size.
+#[test]
+fn a_reference_retained_across_a_changed_sps_of_another_size_is_a_decode_error() {
+    assert_reference_missing(
+        &retained_across_an_sps_change(QP_HIGH_HEVC),
+        "a 64x64 P picture naming a 32x32 picture",
+    );
+}
+
+/// Re-sending the active SPS and PPS unchanged before a P slice keeps the
+/// references (FFmpeg keeps a byte-identical SPS, ps.c `compare_sps`):
+/// the stream decodes exactly as the fixture.
+#[test]
+fn an_identical_sps_resend_keeps_the_references() {
     let [expected, _] = decode_both(I_THEN_P_HEVC);
     let expected = expected.expect("the unmodified fixture decodes");
     assert_eq!(expected.len(), 2);
-    for result in decode_both(&annexb(&resent)) {
+    for result in decode_both(&retained_across_an_sps_change(I_THEN_P_HEVC)) {
         assert_eq!(result.expect("a re-sent, unchanged SPS"), expected);
     }
 }

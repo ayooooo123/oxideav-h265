@@ -284,9 +284,10 @@ where
                 ref_pic,
             });
         }
-        // A used list with an unresolvable reference is a malformed stream;
-        // surface it rather than silently dropping the prediction.
-        return Err(ReconError::InterNotSupported);
+        // A used list with an unresolvable reference is a malformed stream
+        // (or one whose SPS changed under it); surface it rather than
+        // silently dropping the prediction.
+        return Err(ReconError::MissingReference);
     }
     // Unused list: point at any available picture (the prediction skips it).
     let fallback = refs
@@ -1624,9 +1625,9 @@ fn reconstruct_inter_leaf_cu(
 ///
 /// # Errors
 /// [`ReconError::InterNotSupported`] when the picture is an I picture (no
-/// reference lists were built — use the intra driver instead) or a used
-/// reference resolves to "no reference picture"; otherwise the per-CU
-/// reconstruction errors.
+/// reference lists were built — use the intra driver instead);
+/// [`ReconError::MissingReference`] when a used reference resolves to "no
+/// reference picture"; otherwise the per-CU reconstruction errors.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_inter_picture(
     seq: &mut crate::decode::PictureSequenceState,
