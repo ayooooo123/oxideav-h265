@@ -21,6 +21,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   mixed intra/inter, merge/AMVP, tile, slice and WPP fixtures in serial
   and two-thread decoding. Each fixture also exercises 128 deterministic
   VCL mutations followed by recreation and exact full-output recovery.
+- Strict original-FATE coverage (`tests/fate_conformance.rs`, `FATE_SUITE`):
+  52 complete Main/Main10/RExt streams against FFmpeg, serial and two-thread.
+  The availability change preserves all four pre-existing mismatches:
+  two-thread `TILES_A_Cisco_2`, `TILES_B_Cisco_1`, `DSLICE_C_HHI_5`, and
+  serial `SLICES_A_Rovi_3`. Every affected output-frame hash is identical
+  to the upstream baseline. These assertions remain failing, not pinned
+  to incorrect pixels. FFmpeg also rejects the unequal luma/chroma depth
+  in `TSUNEQBD_A_MAIN10_Technicolor_2`; that oracle limit remains explicit.
+  The other 47 originals (1,951 frames per thread budget), including all
+  ten staged RExt cases, match completely.
 
 ## [0.0.14](https://github.com/OxideAV/oxideav-h265/compare/v0.0.13...v0.0.14) - 2026-10-01
 
