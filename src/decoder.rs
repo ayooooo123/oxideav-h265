@@ -308,24 +308,20 @@ fn video_frame_owned(
         let (stride, data) = if w == 0 {
             (0, Vec::new())
         } else if wide {
-            let mut data = vec![0u8; w * rows * 2];
-            for (r, dst) in data.chunks_exact_mut(w * 2).enumerate() {
-                let src = row(r);
-                let mut dst8 = dst.chunks_exact_mut(16);
-                let mut src8 = src.chunks_exact(8);
-                for (d, s) in (&mut dst8).zip(&mut src8) {
-                    let d: &mut [u8; 16] = d.try_into().unwrap();
+            // Filled in place of a zeroed buffer: every byte is written once.
+            let mut data = Vec::with_capacity(w * rows * 2);
+            for r in 0..rows {
+                let mut src8 = row(r).chunks_exact(8);
+                for s in &mut src8 {
                     let s: &[u16; 8] = s.try_into().unwrap();
-                    for (pair, &v) in d.chunks_exact_mut(2).zip(s) {
+                    let mut bytes = [0u8; 16];
+                    for (pair, &v) in bytes.chunks_exact_mut(2).zip(s) {
                         pair.copy_from_slice(&v.to_le_bytes());
                     }
+                    data.extend_from_slice(&bytes);
                 }
-                for (d, &v) in dst8
-                    .into_remainder()
-                    .chunks_exact_mut(2)
-                    .zip(src8.remainder())
-                {
-                    d.copy_from_slice(&v.to_le_bytes());
+                for &v in src8.remainder() {
+                    data.extend_from_slice(&v.to_le_bytes());
                 }
             }
             (w * 2, data)

@@ -43,6 +43,7 @@
 //! a `(xInt, yInt, xFrac, yFrac)` location and a reference plane, and
 //! stops at the prediction sample arrays.
 
+use crate::simd;
 use std::cell::RefCell;
 
 /// A reference-picture luma / chroma sample plane with the §8.5.3.3.3
@@ -545,7 +546,11 @@ fn interp_into<const TAPS: usize>(
         }
         (Some(k), None) | (None, Some(k)) => {
             let step = if hk.is_some() { 1 } else { stride };
-            if bit_depth == 8 {
+            let byte = bit_depth == 8;
+            if bit_depth <= 12 && simd::interp_pass(src, stride, step, k, byte, shift1, w, out) {
+                return;
+            }
+            if byte {
                 filter_block(src, stride, step, k, 0, w, out, byte16, i32::from);
             } else if bit_depth <= 12 {
                 filter_block(src, stride, step, k, shift1, w, out, sample16, same);
@@ -560,12 +565,17 @@ fn interp_into<const TAPS: usize>(
                     scratch.rows16.resize(len, 0);
                 }
                 let rows = &mut scratch.rows16[..len];
-                if bit_depth == 8 {
-                    filter_block(src, stride, 1, hk, 0, w, rows, byte16, same16);
-                } else {
-                    filter_block(src, stride, 1, hk, shift1, w, rows, sample16, |v| v as i16);
+                let byte = bit_depth == 8;
+                if !simd::interp_pass(src, stride, 1, hk, byte, shift1, w, rows) {
+                    if byte {
+                        filter_block(src, stride, 1, hk, 0, w, rows, byte16, same16);
+                    } else {
+                        filter_block(src, stride, 1, hk, shift1, w, rows, sample16, |v| v as i16);
+                    }
                 }
-                filter_block(rows, w, w, vk, 6, w, out, i32::from, same);
+                if !simd::interp_pass(&*rows, w, w, vk, false, 6, w, out) {
+                    filter_block(rows, w, w, vk, 6, w, out, i32::from, same);
+                }
             } else {
                 if scratch.rows.len() < len {
                     scratch.rows.resize(len, 0);
@@ -749,12 +759,18 @@ impl PlanePrediction<'_> {
             } => match (p0, p1) {
                 // Uni-predictive from L0 / L1 (equations 8-262 / 8-263).
                 (Some(p), None) | (None, Some(p)) => {
+                    if T::default_row(out, p, None, shift1, offset1, max) {
+                        return;
+                    }
                     for (o, &p) in out.iter_mut().zip(p) {
                         *o = T::clipped(((p + offset1) >> shift1).clamp(0, max));
                     }
                 }
                 // Bi-predictive (equation 8-264).
                 (Some(a), Some(b)) => {
+                    if T::default_row(out, a, Some(b), shift2, offset2, max) {
+                        return;
+                    }
                     for ((o, &p0), &p1) in out.iter_mut().zip(a).zip(b) {
                         *o = T::clipped(((p0 + p1 + offset2) >> shift2).clamp(0, max));
                     }
@@ -813,6 +829,22 @@ impl PlanePrediction<'_> {
 pub(crate) trait PredSample: Copy {
     /// The sample for an already clipped value.
     fn clipped(v: i32) -> Self;
+
+    /// The architecture form of a default-combine row (`out[ x ] = Clip3(
+    /// 0, max, ( p0[ x ] (+ p1[ x ]) + offset ) >> shift )`), `false`
+    /// when it does not run.
+    #[inline(always)]
+    fn default_row(
+        out: &mut [Self],
+        p0: &[i32],
+        p1: Option<&[i32]>,
+        shift: i32,
+        offset: i32,
+        max: i32,
+    ) -> bool {
+        let _ = (out, p0, p1, shift, offset, max);
+        false
+    }
 }
 
 impl PredSample for i32 {
@@ -826,6 +858,18 @@ impl PredSample for u16 {
     #[inline(always)]
     fn clipped(v: i32) -> Self {
         v as u16
+    }
+
+    #[inline(always)]
+    fn default_row(
+        out: &mut [u16],
+        p0: &[i32],
+        p1: Option<&[i32]>,
+        shift: i32,
+        offset: i32,
+        max: i32,
+    ) -> bool {
+        simd::pred_default_row(out, p0, p1, shift, offset, max)
     }
 }
 

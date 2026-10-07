@@ -36,6 +36,7 @@
 //! follow-up that threads the per-sample slice / tile id.
 
 use crate::picture::{sub_wh_c, Picture, Plane};
+use crate::simd;
 use crate::slice_data::{SaoComponent, SaoCtbParams};
 
 /// `Sign( x )` (§5, equation 5-18).
@@ -519,7 +520,8 @@ fn sao_ctb_core(
                 let (cur, a, b) = (near(0, 0), near(v0, h0), near(v1, h1));
                 let span = &mut drow[lo..lo + n];
                 if narrow {
-                    edge_span::<i16>(span, cur, a, b, by_edge, max);
+                    let k = simd::sao_edge(span, cur, a, b, by_edge, max);
+                    edge_span::<i16>(&mut span[k..], &cur[k..], &a[k..], &b[k..], by_edge, max);
                 } else {
                     edge_span::<i32>(span, cur, a, b, by_edge, max);
                 }
@@ -557,7 +559,8 @@ fn sao_ctb_core(
                     );
                 }
             } else if narrow {
-                band_span::<i16>(drow, cur, band_shift, bands, off, max);
+                let k = simd::sao_band(drow, cur, band_shift, bands, off, max);
+                band_span::<i16>(&mut drow[k..], &cur[k..], band_shift, bands, off, max);
             } else {
                 band_span::<i32>(drow, cur, band_shift, bands, off, max);
             }

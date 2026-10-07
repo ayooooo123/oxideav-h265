@@ -8,6 +8,64 @@ pub mod r410;
 pub mod r413;
 pub mod r416;
 
+/// The availability-recovery corpus streams `(name, stream, 10-bit)`:
+/// Main / Main10, bi-prediction, WPP, slices, tiles, weighted P / B, AMP,
+/// mixed intra / inter, WPP slices and an open GOP.
+pub const RECOVERY_CASES: [(&str, &[u8], bool); 12] = [
+    ("main", I_THEN_P_HEVC, false),
+    ("main10", MAIN10_HEVC, true),
+    ("bipred", BIPRED_HEVC, false),
+    ("wpp", WPP_HEVC, false),
+    ("slices", MULTI_SLICE_HEVC, false),
+    ("tiles", TRUE_TILES_HEVC, false),
+    ("weighted-p", WEIGHTED_P_HEVC, false),
+    ("weighted-b", WEIGHTED_B_HEVC, false),
+    ("amp", r410::RECTAMP_HEVC, false),
+    ("intra-inter", r410::CI_HEVC, false),
+    ("wpp-slices", r410::WPPSLICES_HEVC, false),
+    ("open-gop", r410::OPENGOP_HEVC, false),
+];
+
+/// The seed of the [`vcl_mutation`] sequence over [`RECOVERY_CASES`].
+pub const MUTATION_SEED: u32 = 0x4856_4341;
+
+/// The bytes of `stream` a VCL mutation may hit: each VCL NAL unit's
+/// payload past its two-byte header and first 16 bytes, so parameter sets
+/// and transport headers stay intact while the CABAC / reconstruction path
+/// is reached.
+pub fn vcl_payload_domain(stream: &[u8]) -> Vec<usize> {
+    let starts: Vec<_> = stream
+        .windows(3)
+        .enumerate()
+        .filter_map(|(i, bytes)| (bytes == [0, 0, 1]).then_some(i + 3))
+        .collect();
+    let mut payload = Vec::new();
+    for (i, &start) in starts.iter().enumerate() {
+        let end = starts.get(i + 1).map_or(stream.len(), |next| next - 3);
+        if (stream[start] >> 1) & 63 < 32 {
+            let body = start + 2;
+            payload.extend(body + (end - body).min(16)..end);
+        }
+    }
+    payload
+}
+
+/// Mutation `trial` of `stream` over its `domain`: advances the xorshift
+/// `seed`, flips bit `trial % 8` of the drawn byte, and on every fourth
+/// trial truncates the stream after it.
+pub fn vcl_mutation(stream: &[u8], domain: &[usize], seed: &mut u32, trial: usize) -> Vec<u8> {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 17;
+    *seed ^= *seed << 5;
+    let at = domain[*seed as usize % domain.len()];
+    let mut damaged = stream.to_vec();
+    damaged[at] ^= 1 << (trial % 8);
+    if trial % 4 == 0 {
+        damaged.truncate(at + 1);
+    }
+    damaged
+}
+
 /// RFC 1321 MD5 (self-contained; digests the decoded output for the
 /// vendored-stream pins).
 pub mod md5 {

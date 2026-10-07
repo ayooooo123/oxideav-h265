@@ -524,9 +524,11 @@ pub fn luma_sample_decision(
     beta: i32,
     tc: i32,
 ) -> bool {
-    dpq < (beta >> 2)
-        && (p3 - p0).abs() + (q0 - q3).abs() < (beta >> 3)
-        && (p0 - q0).abs() < (5 * tc + 1) >> 1
+    // All three conditions are evaluated (no short circuit): they are
+    // cheap, and data-dependent branches mispredict.
+    (dpq < (beta >> 2))
+        & ((p3 - p0).abs() + (q0 - q3).abs() < (beta >> 3))
+        & ((p0 - q0).abs() < (5 * tc + 1) >> 1)
 }
 
 /// Decisions emitted by the §8.7.2.5.3 luma edge decision process for a
@@ -668,14 +670,10 @@ pub fn luma_edge_decision(
         // Strong/weak split (eqs. 8-360 step 3).
         let dsam0 = luma_sample_decision(p[0][0], p[3][0], q[0][0], q[3][0], 2 * dpq0, beta, tc);
         let dsam3 = luma_sample_decision(p[0][1], p[3][1], q[0][1], q[3][1], 2 * dpq3, beta, tc);
-        dec.de = if dsam0 && dsam3 { 2 } else { 1 };
+        dec.de = 1 + u8::from(dsam0 & dsam3);
         let thr = (beta + (beta >> 1)) >> 3;
-        if dp < thr {
-            dec.dep = 1; // eq. step g
-        }
-        if dq < thr {
-            dec.deq = 1; // eq. step h
-        }
+        dec.dep = u8::from(dp < thr); // eq. step g
+        dec.deq = u8::from(dq < thr); // eq. step h
     }
     dec
 }
@@ -906,28 +904,25 @@ pub fn filter_luma_block_edge_gated(
     // `s[k][3 - i]` is `p_i,k` and `s[k][4 + i]` is `q_i,k`.
     let mut s = [[0i32; 8]; 4];
     let at = |x: usize, y: usize| (y - plane.y_origin) * plane.stride + x;
-    match edge {
+    let gather = |samples: &[u16], s: &mut [[i32; 8]; 4], k: usize| match edge {
         EdgeType::Vertical => {
-            for (k, line) in s.iter_mut().enumerate() {
-                let o = at(ex - 4, ey + k);
-                for (d, &v) in line.iter_mut().zip(&plane.samples[o..o + 8]) {
-                    *d = i32::from(v);
-                }
+            let o = at(ex - 4, ey + k);
+            for (d, &v) in s[k].iter_mut().zip(&samples[o..o + 8]) {
+                *d = i32::from(v);
             }
         }
         EdgeType::Horizontal => {
-            for j in 0..8 {
-                let o = at(ex, ey + j - 4);
-                for (line, &v) in s.iter_mut().zip(&plane.samples[o..o + 4]) {
-                    line[j] = i32::from(v);
-                }
+            for (j, d) in s[k].iter_mut().enumerate() {
+                *d = i32::from(samples[at(ex + k, ey + j - 4)]);
             }
         }
-    }
+    };
     // `p0..p3` / `q0..q3` of line `k`.
     let p_side = |s: &[[i32; 8]; 4], k: usize| [s[k][3], s[k][2], s[k][1], s[k][0]];
     let q_side = |s: &[[i32; 8]; 4], k: usize| [s[k][4], s[k][5], s[k][6], s[k][7]];
     // The decision grid: lines k = 0 and k = 3, samples i = 0..3 each side.
+    gather(plane.samples, &mut s, 0);
+    gather(plane.samples, &mut s, 3);
     let (p0l, p3l, q0l, q3l) = (p_side(&s, 0), p_side(&s, 3), q_side(&s, 0), q_side(&s, 3));
     let pg: [[i32; 2]; 4] = core::array::from_fn(|i| [p0l[i], p3l[i]]);
     let qg: [[i32; 2]; 4] = core::array::from_fn(|i| [q0l[i], q3l[i]]);
@@ -935,6 +930,23 @@ pub fn filter_luma_block_edge_gated(
     if dec.de == 0 {
         return dec;
     }
+    // Without suppressed samples, the architecture kernel filters and
+    // stores the four lines.
+    if no_filter.is_none()
+        && crate::simd::luma_edge(
+            plane.samples,
+            at(ex, ey),
+            plane.stride,
+            matches!(edge, EdgeType::Vertical),
+            (dec.de, dec.dep, dec.deq),
+            tc,
+            (1 << bit_depth) - 1,
+        )
+    {
+        return dec;
+    }
+    gather(plane.samples, &mut s, 1);
+    gather(plane.samples, &mut s, 2);
     // Apply the filter to each of the 4 lines (eq. 8-372/8-373 layout).
     for k in 0..4 {
         let (p, q) = (p_side(&s, k), q_side(&s, k));

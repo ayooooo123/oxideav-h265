@@ -27,6 +27,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   including the errors reported on malformed streams. The internal
   `recon::extract_cu_residual` / `CuResidual` / `CuResidualPlane` are
   gone.
+- The inverse transform uses the recursive partial butterfly (about a
+  third fewer multiply-accumulates, the same integer sums) and scales
+  whole coefficient rows so short rows vectorize; 10-bit output planes are
+  packed without zero-filling first; the luma deblocking decisions are
+  evaluated without data-dependent branches.
+- On aarch64 (phones and Apple silicon), NEON kernels run luma / chroma
+  interpolation, SAO edge / band offset spans, the default weighted
+  prediction combine and the luma deblocking filters (`src/simd/`). Each
+  mirrors a portable kernel, which stays the reference and runs on every
+  other target and when `simd::set_enabled(false)` is set. The crate now
+  denies `unsafe` code everywhere except that one module, where every
+  pointer access is bounds-checked first. Output is bit-identical either
+  way.
 
 ### Added
 
@@ -35,6 +48,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   mixed intra/inter, merge/AMVP, tile, slice and WPP fixtures in serial
   and two-thread decoding. Each fixture also exercises 128 deterministic
   VCL mutations followed by recreation and exact full-output recovery.
+- `tests/simd_differential.rs`: on aarch64, the NEON and portable kernels
+  decode every embedded and `tests/fixture_bytes` stream, every original
+  FATE HEVC conformance stream (serial and two-thread) and the 1,536-case
+  VCL mutation corpus, and must agree on every frame and reported error.
+  The module's unit tests compare randomized interpolation blocks, SAO
+  pictures, prediction units and luma deblocking segments.
 - Strict original-FATE coverage (`tests/fate_conformance.rs`, `FATE_SUITE`):
   52 complete Main/Main10/RExt streams against FFmpeg, serial and two-thread.
   The availability change preserves all four pre-existing mismatches:

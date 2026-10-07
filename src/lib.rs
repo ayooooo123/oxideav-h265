@@ -241,6 +241,8 @@
 //! header.
 
 #![warn(missing_debug_implementations)]
+// `unsafe` lives only in `simd`'s architecture submodule (scoped allow).
+#![deny(unsafe_code)]
 
 use oxideav_core::RuntimeContext;
 
@@ -324,6 +326,10 @@ pub mod scan;
 #[doc(hidden)]
 pub mod sei;
 pub mod sequence;
+// internal — exposed for tests (the portable/architecture kernel switch);
+// not part of the stable API
+#[doc(hidden)]
+pub mod simd;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod slice;

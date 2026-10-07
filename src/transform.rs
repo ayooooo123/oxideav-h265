@@ -293,16 +293,12 @@ impl<'a> Scaler<'a> {
         })
     }
 
-    /// The scaled `levels` (`n` per row) over their `cols × rows` extent,
-    /// written row-major, `cols` per row, into `d`.
-    fn scale_extent(
-        &self,
-        levels: &[i32],
-        n: usize,
-        (cols, rows): (usize, usize),
-        d: &mut Vec<i32>,
-    ) {
-        let extent = || levels.chunks_exact(n).take(rows).map(|row| &row[..cols]);
+    /// The scaled `levels` (`n` per row) of the first `rows` rows, written
+    /// row-major (`n` per row) into `d`: one contiguous run, so the scaling
+    /// vectorizes however narrow the non-zero columns are (the zero levels
+    /// right of them scale to zero).
+    fn scale_rows(&self, levels: &[i32], n: usize, rows: usize, d: &mut Vec<i32>) {
+        let levels = &levels[..rows * n];
         d.clear();
         if let Some(f) = self.flat_i32 {
             // Equation 8-309 regrouped for a = level · 16 · levelScale:
@@ -317,19 +313,17 @@ impl<'a> Scaler<'a> {
             };
             let (lo, hi) = (self.coeff_min as i32, self.coeff_max as i32);
             let mut wide = false;
-            for row in extent() {
-                d.extend(row.iter().map(|&level| {
-                    wide |= level.unsigned_abs() > 1 << 15;
-                    ((level.wrapping_mul(f) << up).wrapping_add(round) >> down).clamp(lo, hi)
-                }));
-            }
+            d.extend(levels.iter().map(|&level| {
+                wide |= level.unsigned_abs() > 1 << 15;
+                ((level.wrapping_mul(f) << up).wrapping_add(round) >> down).clamp(lo, hi)
+            }));
             if !wide {
                 return;
             }
             // A level outside the conformant range: the exact form.
             d.clear();
         }
-        for (y, row) in extent().enumerate() {
+        for (y, row) in levels.chunks_exact(n).enumerate() {
             d.extend(
                 row.iter()
                     .enumerate()
@@ -608,8 +602,9 @@ thread_local! {
 
 /// §8.6.3 scaling then §8.6.4 transformation of one block's levels, with
 /// the equation 8-299 `bdShift` round folded into the row pass. Only the
-/// non-zero extent of `levels` is scaled: a zero level scales to zero,
-/// and the transform skips the zero columns / rows beyond it.
+/// rows of the non-zero extent of `levels` are scaled (a zero level
+/// scales to zero), and the transform skips the zero columns / rows
+/// beyond the extent.
 fn scaled_inverse_transform(
     levels: &[i32],
     n_tbs: usize,
@@ -624,9 +619,9 @@ fn scaled_inverse_transform(
     };
     SCALED.with(|cell| {
         with_cell_buffer(cell, |d| {
-            scaler.scale_extent(levels, n_tbs, (cols, rows), d);
+            scaler.scale_rows(levels, n_tbs, rows, d);
             inverse_transform_passes(
-                (d, cols),
+                (d, n_tbs),
                 n_tbs,
                 tr_type,
                 precision,
