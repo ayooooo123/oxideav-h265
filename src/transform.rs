@@ -788,25 +788,25 @@ fn transform_passes<T: TransformAcc>(
         }
         let source = (d, d_stride);
         match n_tbs {
-            4 => dct_passes::<T, 4, 2>(source, (cols, rows), clip, finish, g, r),
-            8 => dct_passes::<T, 8, 4>(source, (cols, rows), clip, finish, g, r),
-            16 => dct_passes::<T, 16, 8>(source, (cols, rows), clip, finish, g, r),
-            _ => dct_passes::<T, 32, 16>(source, (cols, rows), clip, finish, g, r),
+            4 => dct_passes::<T, 4>(source, (cols, rows), clip, finish, g, r),
+            8 => dct_passes::<T, 8>(source, (cols, rows), clip, finish, g, r),
+            16 => dct_passes::<T, 16>(source, (cols, rows), clip, finish, g, r),
+            _ => dct_passes::<T, 32>(source, (cols, rows), clip, finish, g, r),
         }
     });
 }
 
-/// §8.6.4 for the `N`-point DCT-II (`HALF == N / 2`): steps 1 and 2
-/// over the first `cols` columns of `d` (row stride `d_stride`; rows
-/// from `rows` on are zero) into the `N × cols` array `g`, then step 3
-/// over every row of `g` into `r`, each output through `finish`.
+/// §8.6.4 for the `N`-point DCT-II: steps 1 and 2 over the first `cols`
+/// columns of `d` (row stride `d_stride`; rows from `rows` on are zero)
+/// into the `N × cols` array `g`, then step 3 over every row of `g` into
+/// `r`, each output through `finish`.
 ///
 /// Basis row 0 is the constant 64, so a lone input at `j == 0`
 /// synthesizes to 64 times itself at every output: a single non-zero
 /// row makes every row of `g` (and so of `r`) the same, and a single
 /// non-zero column makes each row of `r` one value. Both cases compute
 /// those values once.
-fn dct_passes<T: TransformAcc, const N: usize, const HALF: usize>(
+fn dct_passes<T: TransformAcc, const N: usize>(
     (d, d_stride): (&[i32], usize),
     (cols, rows): (usize, usize),
     clip: impl Fn(T) -> T,
@@ -816,15 +816,13 @@ fn dct_passes<T: TransformAcc, const N: usize, const HALF: usize>(
 ) {
     let dc = T::from(64);
     if rows == 1 {
-        let first = &mut g[..cols];
-        for (v, &x) in first.iter_mut().zip(&d[..cols]) {
+        for (v, &x) in g[..cols].iter_mut().zip(&d[..cols]) {
             *v = clip(dc * T::from(x));
         }
-        let (even, odd) = dct_synthesis::<T, N, HALF>(first);
-        let out = &mut r[..N];
-        for i in 0..HALF {
-            out[i] = finish(even[i] + odd[i]);
-            out[N - 1 - i] = finish(even[i] - odd[i]);
+        let first = &g[..cols];
+        let y = synthesis::<T, T, N>(|j| first[j], cols);
+        for (o, v) in r[..N].iter_mut().zip(y) {
+            *o = finish(v);
         }
         for y in 1..N {
             r.copy_within(..N, y * N);
@@ -834,11 +832,11 @@ fn dct_passes<T: TransformAcc, const N: usize, const HALF: usize>(
     // §8.6.4 steps 1 and 2, four columns at a time.
     let mut x = 0;
     while x + 4 <= cols {
-        column_group::<T, N, HALF, 4>((d, d_stride), rows, x, cols, &clip, g);
+        column_group::<T, N, 4>((d, d_stride), rows, x, cols, &clip, g);
         x += 4;
     }
     while x < cols {
-        column_group::<T, N, HALF, 1>((d, d_stride), rows, x, cols, &clip, g);
+        column_group::<T, N, 1>((d, d_stride), rows, x, cols, &clip, g);
         x += 1;
     }
     if cols == 1 {
@@ -848,22 +846,19 @@ fn dct_passes<T: TransformAcc, const N: usize, const HALF: usize>(
         return;
     }
     for (row, out) in g.chunks_exact(cols).zip(r.chunks_exact_mut(N)) {
-        let (even, odd) = dct_synthesis::<T, N, HALF>(row);
-        for i in 0..HALF {
-            out[i] = finish(even[i] + odd[i]);
-            out[N - 1 - i] = finish(even[i] - odd[i]);
+        let y = synthesis::<T, T, N>(|j| row[j], cols);
+        for (o, v) in out.iter_mut().zip(y) {
+            *o = finish(v);
         }
     }
 }
 
 /// [`dct_passes`] steps 1 and 2 for the `L` columns from `x` (inputs
-/// `rows` deep, row stride `d_stride`): the even-`j` and the odd-`j`
-/// partial sums of each output `i < N / 2`, accumulated one half at a
-/// time with the even half parked in `g`, then combined into rows `i`
-/// and `N − 1 − i` of the `cols`-wide `g`. The same integer sums as
-/// [`dct_synthesis`], only grouped across columns.
+/// `rows` deep, row stride `d_stride`): each column's synthesis, one
+/// accumulator lane per column, clipped into rows `0..N` of the
+/// `cols`-wide `g`.
 #[inline(always)]
-fn column_group<T: TransformAcc, const N: usize, const HALF: usize, const L: usize>(
+fn column_group<T: TransformAcc, const N: usize, const L: usize>(
     (d, d_stride): (&[i32], usize),
     rows: usize,
     x: usize,
@@ -871,68 +866,140 @@ fn column_group<T: TransformAcc, const N: usize, const HALF: usize, const L: usi
     clip: &impl Fn(T) -> T,
     g: &mut [T],
 ) {
-    let stride = 32 / N;
-    let half_sums = |first: usize| {
-        let mut acc = [[T::default(); L]; HALF];
-        for j in (first..rows).step_by(2) {
-            let v: &[i32; L] = d[j * d_stride + x..j * d_stride + x + L]
-                .try_into()
-                .unwrap();
-            let m: &[i32; HALF] = DCT32[j * stride][..HALF].try_into().unwrap();
-            for (a, &m) in acc.iter_mut().zip(m) {
-                for (a, &v) in a.iter_mut().zip(v) {
-                    *a = *a + T::from(m) * T::from(v);
-                }
-            }
-        }
-        acc
+    let input = |j: usize| -> [T; L] {
+        let v: &[i32; L] = d[j * d_stride + x..j * d_stride + x + L]
+            .try_into()
+            .unwrap();
+        v.map(T::from)
     };
-    for (i, e) in half_sums(0).iter().enumerate() {
-        g[i * cols + x..i * cols + x + L].copy_from_slice(e);
-    }
-    for (i, o) in half_sums(1).iter().enumerate() {
-        for (l, &o) in o.iter().enumerate() {
-            let e = g[i * cols + x + l];
-            g[i * cols + x + l] = clip(e + o);
-            g[(N - 1 - i) * cols + x + l] = clip(e - o);
+    let y = synthesis::<T, [T; L], N>(input, rows);
+    for (i, y) in y.iter().enumerate() {
+        for (o, &v) in g[i * cols + x..i * cols + x + L].iter_mut().zip(y) {
+            *o = clip(v);
         }
     }
 }
 
-/// One `N`-point DCT-II synthesis `y[ i ] = Σ_j M[ j ][ i ] · x[ j ]`
-/// over the leading inputs `x` (later inputs are zero), returned as the
-/// even-`j` and odd-`j` partial sums for `i < N / 2`.
+/// An operand of [`synthesis`]: a single accumulator (`T`, the outputs
+/// spread across vector lanes) or one per column of a group (`[T; L]`,
+/// the columns across lanes).
+trait PassLane<T>: Copy {
+    fn zero() -> Self;
+    /// `self + m · v`.
+    fn mac(self, m: i32, v: Self) -> Self;
+    fn add(self, o: Self) -> Self;
+    fn sub(self, o: Self) -> Self;
+}
+
+impl<T: TransformAcc> PassLane<T> for T {
+    #[inline(always)]
+    fn zero() -> Self {
+        T::default()
+    }
+    #[inline(always)]
+    fn mac(self, m: i32, v: Self) -> Self {
+        self + T::from(m) * v
+    }
+    #[inline(always)]
+    fn add(self, o: Self) -> Self {
+        self + o
+    }
+    #[inline(always)]
+    fn sub(self, o: Self) -> Self {
+        self - o
+    }
+}
+
+impl<T: TransformAcc, const L: usize> PassLane<T> for [T; L] {
+    #[inline(always)]
+    fn zero() -> Self {
+        [T::default(); L]
+    }
+    #[inline(always)]
+    fn mac(self, m: i32, v: Self) -> Self {
+        core::array::from_fn(|l| self[l] + T::from(m) * v[l])
+    }
+    #[inline(always)]
+    fn add(self, o: Self) -> Self {
+        core::array::from_fn(|l| self[l] + o[l])
+    }
+    #[inline(always)]
+    fn sub(self, o: Self) -> Self {
+        core::array::from_fn(|l| self[l] - o[l])
+    }
+}
+
+/// One `N`-point DCT-II synthesis `y[ i ] = Σ_j M[ j ][ i ] · input( j )`
+/// over the inputs `j < count` (later inputs are zero), as the partial
+/// butterfly: the same integer matrix product, only re-associated.
 ///
-/// The `N`-point basis is row `j · 32 / N` of `DCT32`; it satisfies
-/// `M[ j ][ N − 1 − i ] = (−1)^j · M[ j ][ i ]`, so `y[ i ]` and
-/// `y[ N − 1 − i ]` are the sum and the difference of the two partial
-/// sums: the same integer matrix product, only re-associated.
+/// The `N`-point basis is row `j · 32 / N` of `DCT32`. Its even rows are
+/// the `N / 2`-point basis, and `M[ j ][ N − 1 − i ] = (−1)^j · M[ j ][ i
+/// ]`, so `y` is the `N / 2`-point synthesis `e` of the even inputs and
+/// the odd-input sums `o` over the first `N / 2` outputs: `y[ i ] = e[ i
+/// ] + o[ i ]`, `y[ N − 1 − i ] = e[ i ] − o[ i ]`. Recursing, an input
+/// `j = 2^a · (odd)` feeds only the first `N >> ( a + 1 )` outputs of its
+/// level, and input 0 the constant 64.
 #[inline(always)]
-fn dct_synthesis<T: TransformAcc, const N: usize, const HALF: usize>(
-    x: &[T],
-) -> ([T; HALF], [T; HALF]) {
+fn synthesis<T, V: PassLane<T>, const N: usize>(
+    input: impl Fn(usize) -> V + Copy,
+    count: usize,
+) -> [V; N] {
     let stride = 32 / N;
-    let mut even = [T::default(); HALF];
-    let mut odd = [T::default(); HALF];
-    let pairs = x.chunks_exact(2);
-    let last = pairs.remainder();
-    for (j, pair) in pairs.enumerate() {
-        let (v0, v1) = (pair[0], pair[1]);
-        let m0: &[i32; HALF] = DCT32[2 * j * stride][..HALF].try_into().unwrap();
-        let m1: &[i32; HALF] = DCT32[(2 * j + 1) * stride][..HALF].try_into().unwrap();
-        for i in 0..HALF {
-            even[i] = even[i] + T::from(m0[i]) * v0;
-            odd[i] = odd[i] + T::from(m1[i]) * v1;
+    // The output-size-`M` level: odd multiples of `N / M`.
+    let y1 = [if count > 0 {
+        V::zero().mac(64, input(0))
+    } else {
+        V::zero()
+    }];
+    let y2 = butterfly::<T, V, 1, 2>(y1, odd_level(input, count, N / 2, stride));
+    let y4 = butterfly::<T, V, 2, 4>(y2, odd_level(input, count, N / 4, stride));
+    if N == 4 {
+        return core::array::from_fn(|i| y4[i]);
+    }
+    let y8 = butterfly::<T, V, 4, 8>(y4, odd_level(input, count, N / 8, stride));
+    if N == 8 {
+        return core::array::from_fn(|i| y8[i]);
+    }
+    let y16 = butterfly::<T, V, 8, 16>(y8, odd_level(input, count, N / 16, stride));
+    if N == 16 {
+        return core::array::from_fn(|i| y16[i]);
+    }
+    let y32 = butterfly::<T, V, 16, 32>(y16, odd_level(input, count, 1, stride));
+    core::array::from_fn(|i| y32[i])
+}
+
+/// [`synthesis`]'s odd-input sums of one level: `o[ i ] = Σ_j M[ j ][ i ]
+/// · input( j )` for `i < H` over `j = first, 3 · first, 5 · first, …`
+/// below `count`, `M[ j ]` being row `j · stride` of `DCT32`.
+#[inline(always)]
+fn odd_level<T, V: PassLane<T>, const H: usize>(
+    input: impl Fn(usize) -> V,
+    count: usize,
+    first: usize,
+    stride: usize,
+) -> [V; H] {
+    let mut o = [V::zero(); H];
+    for j in (first..count).step_by(2 * first) {
+        let m: &[i32; H] = DCT32[j * stride][..H].try_into().unwrap();
+        let v = input(j);
+        for (o, &m) in o.iter_mut().zip(m) {
+            *o = o.mac(m, v);
         }
     }
-    if let [v] = *last {
-        let j = x.len() - 1;
-        let m: &[i32; HALF] = DCT32[j * stride][..HALF].try_into().unwrap();
-        for i in 0..HALF {
-            even[i] = even[i] + T::from(m[i]) * v;
-        }
+    o
+}
+
+/// `y[ i ] = e[ i ] + o[ i ]`, `y[ M − 1 − i ] = e[ i ] − o[ i ]` for
+/// `i < H` (`M == 2 · H`).
+#[inline(always)]
+fn butterfly<T, V: PassLane<T>, const H: usize, const M: usize>(e: [V; H], o: [V; H]) -> [V; M] {
+    let mut y = [V::zero(); M];
+    for i in 0..H {
+        y[i] = e[i].add(o[i]);
+        y[M - 1 - i] = e[i].sub(o[i]);
     }
-    (even, odd)
+    y
 }
 
 /// Inputs to the §8.6.2 scaling-and-transformation orchestration that
