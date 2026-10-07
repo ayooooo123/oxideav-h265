@@ -148,6 +148,12 @@ pub enum InterPredError {
         /// The element count actually supplied.
         got: usize,
     },
+    /// A used reference picture's chroma format or component bit depths
+    /// differ from the current picture's: a stream that replaced its SPS
+    /// while a picture coded under the old one is still referenced. Its
+    /// samples are not bounded by the current bit depth the interpolation
+    /// reads them at.
+    ReferenceFormatMismatch,
 }
 
 impl core::fmt::Display for InterPredError {
@@ -171,6 +177,9 @@ impl core::fmt::Display for InterPredError {
             Self::ArrayLengthMismatch { expected, got } => {
                 write!(f, "prediction array length {got} != nPbW*nPbH = {expected}")
             }
+            Self::ReferenceFormatMismatch => f.write_str(
+                "reference picture chroma format or bit depth differs from the current picture's",
+            ),
         }
     }
 }

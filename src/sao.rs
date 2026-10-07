@@ -418,9 +418,9 @@ fn sao_ctb_core(
     let (pw, ph) = (geom.pw, geom.ph);
     let w = n_w.min(pw.saturating_sub(x_ctb));
     let h = n_h.min(ph.saturating_sub(y_ctb));
-    // Samples of at most 14 bits plus offsets of at most 1023 fit `i16`
-    // lanes throughout.
-    let narrow = geom.bit_depth <= 14 && comp.offset_val.iter().all(|o| o.abs() <= 1023);
+    // Samples of at most 14 bits plus offsets in −1023..=1023 fit `i16`
+    // lanes throughout (a range test: `abs()` overflows on `i32::MIN`).
+    let narrow = geom.bit_depth <= 14 && comp.offset_val.iter().all(|o| (-1023..=1023).contains(o));
 
     if comp.sao_type_idx == 2 {
         // §8.7.3.2 edge offset (equations 8-409..8-413).
@@ -1119,5 +1119,33 @@ mod tests {
         // Interior column 5: cur=40, left=36, right=44. Sign(40-36)=+1,
         // Sign(40-44)=−1 ⇒ edgeIdx 2 → 0, offset_val[0]=0 ⇒ unchanged.
         assert_eq!(out.sample(Plane::Luma, 5, 5), 40);
+    }
+
+    /// An offset outside `−1023..=1023` (here `i32::MIN`, what a
+    /// `log2OffsetScale` of 31 makes of an offset of 1) takes the wide path
+    /// with either kernel set: band 16's samples of 128 clip to 0, rather
+    /// than `abs()` overflowing or the offset truncating to the narrow
+    /// lanes' 0.
+    #[test]
+    fn offsets_outside_the_narrow_range_take_the_wide_path() {
+        let mut rec = Picture::new(16, 16, 1, 8, 8);
+        for y in 0..16 {
+            for x in 0..16 {
+                rec.set_sample(Plane::Luma, x, y, 128);
+            }
+        }
+        let comp = ResolvedSaoComponent {
+            sao_type_idx: 1,
+            offset_val: [0, i32::MIN, 0, 0, 0],
+            band_position: 16,
+            eo_class: 0,
+        };
+        let (portable, arch) = crate::simd::both(|| {
+            let mut out = rec.clone();
+            apply_sao_ctb(&rec, &mut out, Plane::Luma, &comp, 0, 0, 16, 16);
+            out.plane(Plane::Luma).to_vec()
+        });
+        assert_eq!(portable, vec![0u16; 256]);
+        assert_eq!(arch, vec![0u16; 256]);
     }
 }

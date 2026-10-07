@@ -649,24 +649,35 @@ pub struct ResolvedList<'a> {
 /// Build the §8.5.3.3.2 [`ListPrediction`] for one reference list,
 /// borrowing the reference picture's luma + (when chroma is present)
 /// Cb / Cr planes for the lifetime `'a`.
+///
+/// A used list's reference must share the current picture's chroma format
+/// and component bit depths: the interpolation reads its samples at the
+/// current bit depths (in 16-bit lanes up to 12 bits, with 16-bit sums at
+/// 8 bits), which a picture coded under a replaced SPS of another format
+/// would exceed.
 fn build_list_prediction<'a>(
     list: &ResolvedList<'a>,
-    chroma_array_type: u8,
+    params: &ReconParams,
 ) -> Result<ListPrediction<'a>, ReconError> {
-    let (lw, lh) = list.ref_pic.plane_dims(Plane::Luma);
-    let lp =
-        RefPlane::new(list.ref_pic.plane(Plane::Luma), lw, lh).map_err(ReconError::InterPred)?;
+    let chroma_array_type = params.chroma_array_type;
+    let reference = list.ref_pic;
+    if list.pred_flag
+        && (reference.chroma_array_type() != chroma_array_type
+            || reference.bit_depth(Plane::Luma) != params.bit_depth_luma
+            || (chroma_array_type != 0
+                && reference.bit_depth(Plane::Cb) != params.bit_depth_chroma))
+    {
+        return Err(ReconError::InterPred(
+            crate::inter_pred::InterPredError::ReferenceFormatMismatch,
+        ));
+    }
+    let (lw, lh) = reference.plane_dims(Plane::Luma);
+    let lp = RefPlane::new(reference.plane(Plane::Luma), lw, lh).map_err(ReconError::InterPred)?;
     let (cb, cr) = if chroma_array_type != 0 {
-        let (cw, ch) = list.ref_pic.plane_dims(Plane::Cb);
+        let (cw, ch) = reference.plane_dims(Plane::Cb);
         (
-            Some(
-                RefPlane::new(list.ref_pic.plane(Plane::Cb), cw, ch)
-                    .map_err(ReconError::InterPred)?,
-            ),
-            Some(
-                RefPlane::new(list.ref_pic.plane(Plane::Cr), cw, ch)
-                    .map_err(ReconError::InterPred)?,
-            ),
+            Some(RefPlane::new(reference.plane(Plane::Cb), cw, ch).map_err(ReconError::InterPred)?),
+            Some(RefPlane::new(reference.plane(Plane::Cr), cw, ch).map_err(ReconError::InterPred)?),
         )
     } else {
         (None, None)
@@ -779,8 +790,8 @@ pub(crate) fn predict_inter_pu_into(
 ) -> Result<(), ReconError> {
     let cat = params.chroma_array_type;
     // Build the §8.5.3.3.2 reference planes for each used list.
-    let lp0 = build_list_prediction(&l0, cat)?;
-    let lp1 = build_list_prediction(&l1, cat)?;
+    let lp0 = build_list_prediction(&l0, params)?;
+    let lp1 = build_list_prediction(&l1, params)?;
     let geom = InterPredGeometry {
         x_pb: x_pb as i32,
         y_pb: y_pb as i32,
@@ -4034,5 +4045,53 @@ mod tests {
         assert!(luma.iter().all(|&v| v == 12), "luma");
         assert!(cb.iter().all(|&v| v == 4), "cb");
         assert!(cr.iter().all(|&v| v == 4), "cr");
+    }
+
+    /// A used reference of another bit depth (a stream that replaced its
+    /// SPS while still referencing a picture coded under the old one) is an
+    /// error with either kernel set, never a panic or a prediction read
+    /// through the current depth's narrow lanes: a constant 10-bit 1023
+    /// reference, an 8-bit picture and an 8×8 half-sample `(2, 0)` luma
+    /// phase, whose 8-bit tap sums would wrap in 16 bits.
+    #[test]
+    fn inter_prediction_rejects_a_reference_of_another_bit_depth() {
+        let params = tiny_params();
+        let mut reference = Picture::new(16, 16, 1, 10, 10);
+        for plane in [Plane::Luma, Plane::Cb, Plane::Cr] {
+            let (w, h) = reference.plane_dims(plane);
+            for y in 0..h {
+                for x in 0..w {
+                    reference.set_sample(plane, x, y, 1023);
+                }
+            }
+        }
+        let list = |pred_flag| ResolvedList {
+            pred_flag,
+            mv_l: [2, 0],
+            mv_c: crate::motion::derive_chroma_mv([2, 0], 2, 2),
+            ref_pic: &reference,
+        };
+        let (portable, arch) = crate::simd::both(|| {
+            let mut pic = Picture::new(16, 16, 1, 8, 8);
+            reconstruct_inter_pu_weighted(
+                &mut pic,
+                &params,
+                4,
+                4,
+                8,
+                8,
+                list(true),
+                list(false),
+                None,
+                None,
+                None,
+                None,
+            )
+            .map_err(|e| e.to_string())
+        });
+        for result in [portable, arch] {
+            let error = result.expect_err("a 10-bit reference of an 8-bit picture");
+            assert!(error.contains("reference picture"), "{error}");
+        }
     }
 }

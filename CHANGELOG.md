@@ -65,6 +65,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   The other 47 originals (1,951 frames per thread budget), including all
   ten staged RExt cases, match completely.
 
+### Fixed
+
+- A P or B picture whose reference was decoded under a replaced SPS of
+  another bit depth or chroma format is now a decode error. Before, the
+  reference's samples were read at the current bit depth: in an 8-bit
+  picture, 10-bit samples overflowed the 16-bit interpolation sums (a panic
+  with overflow checks, wrapped samples without), with either kernel set.
+- `log2_sao_offset_scale_luma` / `_chroma` above `Max( 0, BitDepth − 10 )`
+  of the active SPS are now a decode error, as FFmpeg rejects them. Before,
+  a scale of 31 made an offset of 1 `i32::MIN`: with overflow checks the
+  16-bit SAO lane test panicked, and without them the offset entered those
+  lanes and was truncated to 0. That lane test is now a range test, so a
+  directly supplied offset outside `−1023..=1023` takes the 32-bit path.
+- `tests/hostile_parameter_sets.rs` decodes both cases end to end (an
+  8-bit SPS, PPS and P slice after a 10-bit IDR; PPS scales of 1 and 31 on
+  an 8-bit stream) with both kernel sets and requires an error; a re-sent
+  unchanged SPS and in-range scales still decode exactly.
+
 ## [0.0.14](https://github.com/OxideAV/oxideav-h265/compare/v0.0.13...v0.0.14) - 2026-10-01
 
 ### Added

@@ -804,6 +804,24 @@ impl SequenceDecoder {
         });
         let sps: &SeqParameterSet = sps_override.as_ref().unwrap_or(sps_raw);
 
+        // §7.4.3.3.2: log2_sao_offset_scale_luma / _chroma lie in 0 ..=
+        // Max( 0, BitDepth − 10 ) of the active SPS — checked here, the
+        // PPS being parsed without its SPS (FFmpeg rejects the PPS), before
+        // the scales reach `u8` and the eq. 7-72 shift.
+        if let Some(range) = &pps.pps_range_extension {
+            let bound = |bit_depth: u8| u32::from(bit_depth.saturating_sub(10));
+            if range.log2_sao_offset_scale_luma > bound(sps.bit_depth_luma()) {
+                return Err(SequenceError::Malformed(
+                    "log2_sao_offset_scale_luma exceeds Max( 0, BitDepthY - 10 )",
+                ));
+            }
+            if range.log2_sao_offset_scale_chroma > bound(sps.bit_depth_chroma()) {
+                return Err(SequenceError::Malformed(
+                    "log2_sao_offset_scale_chroma exceeds Max( 0, BitDepthC - 10 )",
+                ));
+            }
+        }
+
         let geom = Geometry::derive(sps, pps)?;
 
         // §C.5.2.2 — pictures the previous picture's RPS left "unused

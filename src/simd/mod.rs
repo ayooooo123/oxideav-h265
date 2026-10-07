@@ -175,24 +175,33 @@ pub(crate) fn luma_edge(
     false
 }
 
+/// Serializes the tests that flip the process-wide switch.
+#[cfg(test)]
+static SWITCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `f` with the portable kernels, then with the architecture ones (the
+/// portable ones again off aarch64), holding the switch for the whole call
+/// and restoring the default even when `f` panics.
+#[cfg(test)]
+pub(crate) fn both<R>(f: impl Fn() -> R) -> (R, R) {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_enabled(true);
+        }
+    }
+    let _guard = SWITCH.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = Restore;
+    set_enabled(false);
+    let portable = f();
+    set_enabled(true);
+    (portable, f())
+}
+
 #[cfg(all(test, target_arch = "aarch64"))]
 mod tests {
     use super::*;
     use crate::inter_pred::{interp_chroma_block, interp_luma_block, RefPlane};
-    use std::sync::Mutex;
-
-    /// Serializes the tests that flip the process-wide switch.
-    static SWITCH: Mutex<()> = Mutex::new(());
-
-    /// `f` with the portable kernels, then with the architecture ones.
-    fn both<R>(f: impl Fn() -> R) -> (R, R) {
-        let _guard = SWITCH.lock().unwrap_or_else(|e| e.into_inner());
-        set_enabled(false);
-        let portable = f();
-        set_enabled(true);
-        let arch = f();
-        (portable, arch)
-    }
 
     struct Lcg(u64);
 
