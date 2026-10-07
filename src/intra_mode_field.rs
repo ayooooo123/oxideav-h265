@@ -289,6 +289,14 @@ impl IntraModeField {
         c.written && matches!(c.pred_mode, CuPredMode::Intra)
     }
 
+    /// Inter availability uses the motion field's conservative background:
+    /// an unwritten cell (including outside a stored band) is not inter.
+    #[must_use]
+    pub(crate) fn is_inter_at(&self, x_luma: usize, y_luma: usize) -> bool {
+        let c = self.cell_at(x_luma, y_luma);
+        c.written && !matches!(c.pred_mode, CuPredMode::Intra)
+    }
+
     /// Record a non-intra coding unit (`MODE_INTER` / `MODE_SKIP`) across
     /// its `n_cb` × `n_cb` luma samples. The §8.4.2 candidate derivation
     /// maps such a neighbour to `INTRA_DC`, but the cell must be marked

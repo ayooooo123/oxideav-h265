@@ -6,6 +6,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Inter prediction-block availability now reads the existing reconstruction
+  mode grid instead of allocating and scanning the full motion field for
+  every inter CU. Completed inter CUs stamp that grid; intra stamps, WPP
+  halos, tile bands, slice/z-order gates and the current-CU inter override
+  are preserved. No extra picture-sized storage or decoder API change.
+
+### Added
+
+- Complete-picture motion-neighbour regression for all eight partition
+  shapes, plus complete FFmpeg output checks for twelve Main/Main10,
+  mixed intra/inter, merge/AMVP, tile, slice and WPP fixtures in serial
+  and two-thread decoding. Each fixture also exercises 128 deterministic
+  VCL mutations followed by recreation and exact full-output recovery.
+
 ## [0.0.14](https://github.com/OxideAV/oxideav-h265/compare/v0.0.13...v0.0.14) - 2026-10-01
 
 ### Added

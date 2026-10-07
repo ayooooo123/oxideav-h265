@@ -525,8 +525,8 @@ pub struct PlacedInterCtu<'a> {
 /// the in-progress motion field + the collocated `col_field`, then §8.5.3.3
 /// motion-compensated reconstruction). The §6.4.2 prediction-block
 /// availability the candidate derivation needs is evaluated against the
-/// shared [`crate::recon::ReconCtx`] tiling + the per-cell intra / inter
-/// flag of the motion field built up so far.
+/// shared [`crate::recon::ReconCtx`] tiling + its independently stored
+/// intra / inter modes, stamped as each CU is reconstructed.
 ///
 /// Returns the reconstructed picture and its per-PU motion field (the
 /// §8.5.3.2.9 collocated arrays a later picture's temporal MVP reads). The
@@ -1546,23 +1546,14 @@ fn reconstruct_inter_leaf_cu(
         return Ok(());
     }
 
-    // §6.4.2 prediction-block availability against the shared tiling + the
-    // per-cell intra / inter flag of the motion field. The candidate
-    // derivation also *mutates* `field` (writing each PU's resolved motion),
-    // so the closure cannot borrow `field` directly; snapshot the per-4×4
-    // intra-flag grid up front. A neighbour outside the current CU was
-    // decoded before it, so its intra flag is already final; positions
-    // inside the current CU are excluded by the §6.4.2 z-scan test.
+    // §6.4.2 reads the existing reconstruction mode grid independently of
+    // the mutable motion field. Intra reconstruction stamps its PBs; this
+    // path stamps each completed inter CU below. The same bounded grid
+    // already follows tile bands and WPP halo exchange, so availability
+    // needs neither another picture-sized allocation nor a per-CU scan.
     let x_cb = cu.x0;
     let y_cb = cu.y0;
-    let w4 = field.width_4();
-    let h4 = field.height_4();
-    let mut intra_grid = vec![false; w4 * h4];
-    for (gy, row) in intra_grid.chunks_mut(w4).enumerate() {
-        for (gx, cell) in row.iter_mut().enumerate() {
-            *cell = field.cell_at(gx * 4, gy * 4).is_intra;
-        }
-    }
+    let modes = ctx.intra_field();
     let tiling = ctx.tiling();
     let available = |x_nb: i32, y_nb: i32| -> bool {
         let cu_pred_mode = |x: u32, y: u32| -> u8 {
@@ -1573,15 +1564,14 @@ fn reconstruct_inter_leaf_cu(
             // earlier-partition region of this CU is ever consulted
             // (e.g. the §8.5.3.2.7 AMVP neighbours of a 2NxN / Nx2N
             // second partition read the first partition's motion). The
-            // pre-CU snapshot below would otherwise report the
-            // motion-field background (intra) there.
+            // not-yet-stamped mode grid would otherwise report the
+            // unwritten (intra) background there.
             if (x_cb..x_cb + n_cb_s as u32).contains(&x)
                 && (y_cb..y_cb + n_cb_s as u32).contains(&y)
             {
                 return 0;
             }
-            let (gx, gy) = ((x as usize) / 4, (y as usize) / 4);
-            if gx < w4 && gy < h4 && intra_grid[gy * w4 + gx] {
+            if !modes.is_inter_at(x as usize, y as usize) {
                 crate::availability::MODE_INTRA
             } else {
                 0
@@ -1614,7 +1604,14 @@ fn reconstruct_inter_leaf_cu(
         refs,
         qp_y,
         slice.wp.as_ref(),
-    )
+    )?;
+    ctx.intra_field_mut().record_non_intra_cu(
+        x_cb as usize,
+        y_cb as usize,
+        n_cb_s,
+        cu.cu_pred_mode,
+    );
+    Ok(())
 }
 
 /// §8.3 + §8.5 — decode one inter (P / B) picture end to end against the
@@ -2089,6 +2086,102 @@ mod tests {
             two_versions_curr_pic: false,
             pps_cb_qp_offset: 0,
             pps_cr_qp_offset: 0,
+        }
+    }
+
+    /// AMVP in a later partition must see the first partition, and a
+    /// later CU must see the completed CU. Check every reconstructed
+    /// sample for all symmetric and asymmetric partition shapes.
+    #[test]
+    fn partition_and_cu_neighbours_preserve_shifted_picture() {
+        use crate::binarization::{InterPredIdc, MvdComponent};
+        use crate::pu_mv::pu_partitions;
+        use crate::slice_data::{CodingQuadtree, CodingTreeUnit};
+
+        let params = p_params();
+        let mut reference = flat_ref(0, 90);
+        for y in 0..32 {
+            for x in 0..32 {
+                reference.set_sample(Plane::Luma, x, y, (x + 3 * y) as i32);
+            }
+        }
+        let entries = vec![dpb_entry(0, reference)];
+        let lists = RefPicLists {
+            list0: vec![Some(0)],
+            list1: None,
+        };
+        let refs = RefListAccess {
+            lists: &lists,
+            entries: &entries,
+        };
+        let slice = p_slice_ctx();
+        let tiles = crate::availability::TilingParams::single_tile();
+        for mode in [
+            PartMode::Part2Nx2N,
+            PartMode::Part2NxN,
+            PartMode::PartNx2N,
+            PartMode::Part2NxnU,
+            PartMode::Part2NxnD,
+            PartMode::PartNLx2N,
+            PartMode::PartNRx2N,
+            PartMode::PartNxN,
+        ] {
+            let mut first = inter_cu_16(merge_pu(0), None);
+            first.part_mode = mode;
+            let rects = pu_partitions(0, 0, 16, mode.into());
+            first.prediction_units = rects
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    let component = |value| MvdComponent {
+                        greater0_flag: u8::from(value != 0),
+                        greater1_flag: None,
+                        minus2: None,
+                        sign_flag: None,
+                        value,
+                    };
+                    PredictionUnit {
+                        merge_flag: false,
+                        merge_idx: None,
+                        inter_pred_idc: Some(InterPredIdc::PredL0),
+                        ref_idx_l0: Some(0),
+                        mvd_l0: Some([component(if i == 0 { 4 } else { 0 }), component(0)]),
+                        mvp_l0_flag: Some(0),
+                        ref_idx_l1: None,
+                        mvd_l1: None,
+                        mvp_l1_flag: None,
+                    }
+                })
+                .collect();
+            let mut children = vec![CodingQuadtree::Leaf(Box::new(first))];
+            for (x0, y0) in [(16, 0), (0, 16), (16, 16)] {
+                let mut cu = inter_cu_16(merge_pu(0), None);
+                cu.x0 = x0;
+                cu.y0 = y0;
+                children.push(CodingQuadtree::Leaf(Box::new(cu)));
+            }
+            let ctu = CodingTreeUnit {
+                sao: None,
+                quadtree: CodingQuadtree::Split(children),
+            };
+            let placed = [PlacedInterCtu {
+                x_ctb: 0,
+                y_ctb: 0,
+                slice_addr_rs: 0,
+                filter_across_slices: true,
+                ctu: &ctu,
+            }];
+            let (pic, _) =
+                reconstruct_inter_picture(32, 32, &params, &slice, &tiles, &placed, &refs, None)
+                    .unwrap();
+            let mut expected = Vec::with_capacity(32 * 32 * 3 / 2);
+            for y in 0..32 {
+                for x in 0..32 {
+                    expected.push(((x + 1).min(31) + 3 * y) as u8);
+                }
+            }
+            expected.extend(vec![90; 16 * 16 * 2]);
+            assert_eq!(pic.to_planar_u8().unwrap(), expected, "{mode:?}");
         }
     }
 
