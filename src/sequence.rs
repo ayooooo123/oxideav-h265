@@ -55,6 +55,10 @@ const NAL_VPS: u8 = 32;
 const NAL_SPS: u8 = 33;
 /// NAL unit type: picture parameter set.
 const NAL_PPS: u8 = 34;
+/// NAL unit type: end of sequence (Table 7-1).
+const NAL_EOS: u8 = 36;
+/// NAL unit type: end of bitstream (Table 7-1).
+const NAL_EOB: u8 = 37;
 
 /// Errors from the whole-bitstream decode driver.
 #[derive(Debug)]
@@ -380,6 +384,9 @@ struct LayerState {
     poc_decremented: bool,
     /// The identity of the SPS the layer's last picture activated.
     active_sps: Option<u64>,
+    /// Whether the layer's most recent IRAP picture had `NoRaslOutputFlag == 1`.
+    /// Associated RASL pictures that follow it are skipped (§8.1.3).
+    last_cra_no_rasl: bool,
 }
 
 /// The bytes FFmpeg compares to recognise a re-sent VPS or SPS (the VPS
@@ -453,6 +460,12 @@ pub struct SequenceDecoder {
     /// Buffers of pictures nothing references any more, for the next
     /// pictures.
     spare: SpareBuffers,
+    /// An end-of-sequence / end-of-bitstream NAL was seen; the next IRAP
+    /// picture starts a new coded video sequence with `NoRaslOutputFlag == 1`.
+    eos_seen: bool,
+    /// §C.5.2.2 `no_output_of_prior_pics_flag`: an IRAP signaled or
+    /// inferred discarding of prior unoutput pictures in the DPB.
+    no_output_prior: bool,
 }
 
 /// The sample planes and motion fields of pictures that left the DPB
@@ -762,7 +775,16 @@ impl SequenceDecoder {
                 let pps = PicParameterSet::parse(&rbsp)?;
                 self.pps.insert(pps.pps_id, pps);
             }
-            // AUD / EOS / EOB / FD / SEI: nothing to activate.
+            NAL_EOS | NAL_EOB => {
+                if header.nuh_layer_id == 0 {
+                    self.finish_picture()?;
+                    self.eos_seen = true;
+                    self.au.seen_vcl = false;
+                    self.au.pictures.clear();
+                    self.au.max_layer = None;
+                }
+            }
+            // AUD / FD / SEI: nothing to activate.
             _ => {}
         }
         Ok(())
@@ -785,8 +807,39 @@ impl SequenceDecoder {
         self.state.dpb_mut().clear();
         self.au.pictures.clear();
         self.spare = SpareBuffers::default();
+        self.eos_seen = true;
+        for layer in self.layers.values_mut() {
+            layer.last_cra_no_rasl = false;
+        }
     }
 
+    /// Discard all carry-over state (DPB, pending slices, reorder queue,
+    /// decoder position) so the decoder can resume from a new bitstream
+    /// position (e.g. after a seek). Activated parameter sets (VPS, SPS,
+    /// PPS) are retained.
+    pub fn reset(&mut self) -> Result<(), SequenceError> {
+        self.pending.clear();
+        self.frames.clear();
+        self.release_references();
+        self.seen_picture = false;
+        self.cvs_index = 0;
+        self.au = AccessUnit::default();
+        for layer in self.layers.values_mut() {
+            *layer = LayerState::default();
+        }
+        Ok(())
+    }
+
+    /// The current coded video sequence index.
+    #[must_use]
+    pub fn cvs_index(&self) -> u32 {
+        self.cvs_index
+    }
+
+    /// Whether an IRAP picture signaled discarding prior unoutput pictures.
+    pub fn take_no_output_prior(&mut self) -> bool {
+        std::mem::take(&mut self.no_output_prior)
+    }
     /// Keep an output plane for later pictures once nothing else shares
     /// it (a shared one is simply released).
     pub(crate) fn recycle_plane(&mut self, plane: std::sync::Arc<Vec<u16>>) {
@@ -841,6 +894,16 @@ impl SequenceDecoder {
             return Err(SequenceError::Malformed(
                 "first slice segment of a picture is dependent",
             ));
+        }
+        let nal_kind = NalKind::new(indep.nal_type);
+        let layer_id = indep.layer_id;
+        let lstate = self.layers.get(&layer_id).copied().unwrap_or_default();
+        // §8.1.3: when a CRA/BLA starts decoding with NoRaslOutputFlag == 1,
+        // its associated RASL pictures are not output and need not be decoded.
+        // A RASL picture preceding any decoded picture in its layer cannot
+        // be decoded either.
+        if nal_kind.is_rasl() && (lstate.last_cra_no_rasl || !lstate.first_pic_decoded) {
+            return Ok(());
         }
         let plan = self.plan();
         let pps = self
@@ -934,8 +997,11 @@ impl SequenceDecoder {
                 .iter()
                 .all(|&r| self.layers.get(&r).is_some_and(|l| l.initialized))
         });
+        let is_cra_eos = nal_kind.is_cra() && self.eos_seen;
         let no_rasl_output = if layer_id == 0 {
-            nal_kind.is_idr() || nal_kind.is_bla() || (nal_kind.is_irap() && !self.seen_picture)
+            nal_kind.is_idr()
+                || nal_kind.is_bla()
+                || (nal_kind.is_irap() && (!self.seen_picture || self.eos_seen))
         } else {
             nal_kind.is_idr()
                 || nal_kind.is_bla()
@@ -943,11 +1009,35 @@ impl SequenceDecoder {
                     && (!lstate.first_pic_decoded
                         || (!lstate.initialized && ref_layers_initialized)))
         };
+        let no_output_prior =
+            indep.header.no_output_of_prior_pics_flag == Some(true) || is_cra_eos;
+        if nal_kind.is_irap() && no_rasl_output && no_output_prior {
+            self.no_output_prior = true;
+            // §C.5.2.2: all picture storage buffers in the DPB of the layer
+            // are emptied without output of the pictures they contain.
+            let dpb_pocs: Vec<i32> = self
+                .state
+                .dpb()
+                .entries()
+                .iter()
+                .filter(|e| e.layer_id == layer_id)
+                .map(|e| e.poc)
+                .collect();
+            for f in &mut self.frames {
+                if f.layer_id == layer_id && dpb_pocs.contains(&f.poc) {
+                    f.output = false;
+                }
+            }
+            self.state.dpb_mut().unmark_layer(layer_id);
+        }
         if layer_id == 0 {
             if nal_kind.is_irap() && no_rasl_output && self.seen_picture {
                 self.cvs_index += 1;
             }
             self.seen_picture = true;
+            if nal_kind.is_irap() {
+                self.eos_seen = false;
+            }
         }
         // F.8.1.3: LayerInitializedFlag.
         let mut initialized = lstate.initialized;
@@ -1357,6 +1447,11 @@ impl SequenceDecoder {
         let st = self.layers.entry(layer_id).or_default();
         st.first_pic_decoded = true;
         st.initialized = initialized;
+        if nal_kind.is_cra() || nal_kind.is_bla() {
+            st.last_cra_no_rasl = no_rasl_output;
+        } else if nal_kind.is_idr() {
+            st.last_cra_no_rasl = false;
+        }
         Ok(())
     }
 

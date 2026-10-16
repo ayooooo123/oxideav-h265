@@ -166,6 +166,10 @@ impl H265Decoder {
     /// frame that is guaranteed next in output order.
     fn drain(&mut self, flush: bool) {
         self.reorder.extend(self.seq.take_decoded());
+        if self.seq.take_no_output_prior() {
+            let cur_cvs = self.seq.cvs_index();
+            self.reorder.retain(|f| f.cvs_index >= cur_cvs);
+        }
         // Output order: POC within a CVS, the layers of one access unit
         // consecutively by increasing nuh_layer_id.
         self.reorder
@@ -233,6 +237,7 @@ impl Decoder for H265Decoder {
             // An empty packet is treated as a flush signal too.
             return self.flush();
         }
+        self.flushed = false;
         if let Some(pts) = packet.pts {
             self.pts_queue.push(std::cmp::Reverse(pts));
         }
@@ -295,6 +300,18 @@ impl Decoder for H265Decoder {
         self.seq.release_references();
         self.flushed = true;
         self.drain(true);
+        Ok(())
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.pts_queue.clear();
+        self.ready.clear();
+        self.reorder.clear();
+        self.flushed = false;
+        self.last_output = None;
+        self.seq
+            .reset()
+            .map_err(|e| Error::InvalidData(format!("h265 reset: {e}")))?;
         Ok(())
     }
 }

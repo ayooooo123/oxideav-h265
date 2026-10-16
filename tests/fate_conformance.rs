@@ -193,6 +193,8 @@ fn original_fate_main_main10_and_rext_complete_output() {
         "TSUNEQBD_A_MAIN10_Technicolor_2.bit",
         "WP_A_MAIN10_Toshiba_3.bit",
         "WP_MAIN10_B_Toshiba_3.bit",
+        "RAP_A_docomo_4.bit",
+        "RAP_B_Bossen_1.bit",
     ] {
         if let Err(error) = check(&fate.join("hevc-conformance").join(name), &dir) {
             eprintln!("FAIL {name}: {error}");
@@ -202,5 +204,161 @@ fn original_fate_main_main10_and_rext_complete_output() {
     assert!(
         failed.is_empty(),
         "original FATE conformance failures: {failed:#?}"
+    );
+}
+
+#[test]
+fn decode_from_midstream_cra_after_reset_matches_ffmpeg() {
+    let root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target"));
+    let dir = root.join("hevc-cra-repro");
+    fs::create_dir_all(&dir).unwrap();
+    let stream_path = dir.join("open_gop_repro.hevc");
+    let status = Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=25",
+            "-t",
+            "4",
+            "-c:v",
+            "libx265",
+            "-x265-params",
+            "keyint=25:min-keyint=25:open-gop=1:bframes=3",
+            "-f",
+            "hevc",
+        ])
+        .arg(&stream_path)
+        .status()
+        .expect("ffmpeg with libx265 required");
+    assert!(status.success(), "ffmpeg generated open-GOP stream");
+
+    let data = fs::read(&stream_path).unwrap();
+
+    // Split stream into Annex B NAL chunks and find the second CRA access unit.
+    let mut starts: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < data.len().saturating_sub(2) {
+        if data[i..].starts_with(&[0, 0, 1]) {
+            starts.push(i);
+            i += 3;
+        } else if data[i..].starts_with(&[0, 0, 0, 1]) {
+            starts.push(i);
+            i += 4;
+        } else {
+            i += 1;
+        }
+    }
+    starts.push(data.len());
+
+    // Locate the second CRA (nal_type == 21) and its preceding parameter sets.
+    let mut cra_count = 0;
+    let mut cra_offset = None;
+    for &offset in &starts[..starts.len() - 1] {
+        let sc = if data[offset..].starts_with(&[0, 0, 0, 1]) { 4 } else { 3 };
+        let nal_type = (data[offset + sc] >> 1) & 0x3f;
+        if nal_type == 32 && cra_count == 1 && cra_offset.is_none() {
+            cra_offset = Some(offset);
+        } else if nal_type == 21 {
+            cra_count += 1;
+            if cra_count == 2 && cra_offset.is_none() {
+                cra_offset = Some(offset);
+            }
+        }
+    }
+    let cra_offset = cra_offset.expect("found second CRA access unit in stream");
+    let cra_data = &data[cra_offset..];
+
+    // Compute oracle hashes from FFmpeg starting from that CRA point.
+    let mut oracle_cmd = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-nostdin",
+            "-threads",
+            "1",
+            "-f",
+            "hevc",
+            "-i",
+            "-",
+            "-fps_mode",
+            "passthrough",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "framemd5",
+            "-",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("ffmpeg oracle process");
+    {
+        use std::io::Write;
+        let mut stdin = oracle_cmd.stdin.take().unwrap();
+        stdin.write_all(cra_data).unwrap();
+    }
+    let oracle_output = oracle_cmd.wait_with_output().unwrap();
+    assert!(oracle_output.status.success(), "ffmpeg oracle decode");
+    let oracle_text = String::from_utf8(oracle_output.stdout).unwrap();
+    let expected: Vec<String> = oracle_text
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .map(|l| l.rsplit(',').next().unwrap().trim().to_owned())
+        .collect();
+    assert!(!expected.is_empty(), "FFmpeg produced output frames from CRA");
+
+    // Test: decode stream up to the midstream CRA, call reset(), then decode from CRA.
+    let mut decoder = oxideav_h265::make_decoder(&CodecParameters::video("h265".into()))
+        .expect("make_decoder");
+
+    // Feed initial packets before the CRA.
+    let pre_cra = &data[..cra_offset];
+    let _ = decoder.send_packet(&Packet::new(0, TimeBase::new(1, 25), pre_cra.to_vec()));
+    let mut pre_hashes = Vec::new();
+    let _ = receive(decoder.as_mut(), &mut pre_hashes);
+
+    // Seek / reset onto the CRA.
+    decoder.reset().expect("decoder reset succeeds");
+
+    // Feed the stream starting from the CRA.
+    let mut cra_starts: Vec<usize> = Vec::new();
+    let mut j = 0;
+    while j < cra_data.len().saturating_sub(2) {
+        if cra_data[j..].starts_with(&[0, 0, 1]) {
+            cra_starts.push(j);
+            j += 3;
+        } else if cra_data[j..].starts_with(&[0, 0, 0, 1]) {
+            cra_starts.push(j);
+            j += 4;
+        } else {
+            j += 1;
+        }
+    }
+    cra_starts.push(cra_data.len());
+
+    let mut actual_hashes = Vec::new();
+    for offsets in cra_starts.windows(2) {
+        decoder
+            .send_packet(&Packet::new(
+                0,
+                TimeBase::new(1, 25),
+                cra_data[offsets[0]..offsets[1]].to_vec(),
+            ))
+            .expect("send_packet succeeds from CRA");
+        receive(decoder.as_mut(), &mut actual_hashes).expect("receive frames");
+    }
+    decoder.flush().expect("decoder flush");
+    receive(decoder.as_mut(), &mut actual_hashes).expect("receive flushed frames");
+
+    assert_eq!(
+        actual_hashes, expected,
+        "decoded frames from mid-stream CRA after reset must match FFmpeg byte-exact"
     );
 }
