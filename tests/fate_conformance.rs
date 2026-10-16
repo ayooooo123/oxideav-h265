@@ -8,6 +8,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::OnceLock,
 };
 
 fn receive_frames(
@@ -217,45 +218,58 @@ fn original_fate_main_main10_and_rext_complete_output() {
     );
 }
 
-fn ensure_open_gop_stream(dir: &Path) -> (PathBuf, PathBuf) {
-    fs::create_dir_all(dir).expect("create dir");
-    let mp4_path = dir.join("open_gop_repro.mp4");
-    let hevc_path = dir.join("open_gop_repro.hevc");
-    if !mp4_path.exists() || !hevc_path.exists() {
-        let status = Command::new("ffmpeg")
-            .args([
-                "-nostdin",
-                "-v",
-                "error",
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc2=size=320x240:rate=25",
-                "-t",
-                "4",
-                "-c:v",
-                "libx265",
-                "-x265-params",
-                "keyint=25:min-keyint=25:open-gop=1:bframes=3",
-                "-tag:v",
-                "hvc1",
-            ])
-            .arg(&mp4_path)
-            .status()
-            .expect("ffmpeg with libx265 required");
-        assert!(status.success(), "ffmpeg generated open-GOP stream");
+static OPEN_GOP_STREAM: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
 
-        let status_hevc = Command::new("ffmpeg")
-            .args(["-nostdin", "-v", "error", "-y", "-i"])
-            .arg(&mp4_path)
-            .args(["-c:v", "copy", "-f", "hevc"])
-            .arg(&hevc_path)
-            .status()
-            .expect("ffmpeg extract hevc");
-        assert!(status_hevc.success());
-    }
-    (mp4_path, hevc_path)
+fn ensure_open_gop_stream(dir: &Path) -> (PathBuf, PathBuf) {
+    OPEN_GOP_STREAM
+        .get_or_init(|| {
+            fs::create_dir_all(dir).expect("create dir");
+            let mp4_path = dir.join("open_gop_repro.mp4");
+            let hevc_path = dir.join("open_gop_repro.hevc");
+            let pid = std::process::id();
+            let mp4_tmp = dir.join(format!("open_gop_repro.{pid}.tmp.mp4"));
+            let hevc_tmp = dir.join(format!("open_gop_repro.{pid}.tmp.hevc"));
+
+            if !mp4_path.exists() || !hevc_path.exists() {
+                let status = Command::new("ffmpeg")
+                    .args([
+                        "-nostdin",
+                        "-v",
+                        "error",
+                        "-y",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "testsrc2=size=320x240:rate=25",
+                        "-t",
+                        "4",
+                        "-c:v",
+                        "libx265",
+                        "-x265-params",
+                        "keyint=25:min-keyint=25:open-gop=1:bframes=3",
+                        "-tag:v",
+                        "hvc1",
+                    ])
+                    .arg(&mp4_tmp)
+                    .status()
+                    .expect("ffmpeg with libx265 required");
+                assert!(status.success(), "ffmpeg generated open-GOP stream");
+
+                let status_hevc = Command::new("ffmpeg")
+                    .args(["-nostdin", "-v", "error", "-y", "-i"])
+                    .arg(&mp4_tmp)
+                    .args(["-c:v", "copy", "-f", "hevc"])
+                    .arg(&hevc_tmp)
+                    .status()
+                    .expect("ffmpeg extract hevc");
+                assert!(status_hevc.success());
+
+                fs::rename(&mp4_tmp, &mp4_path).expect("rename mp4");
+                fs::rename(&hevc_tmp, &hevc_path).expect("rename hevc");
+            }
+            (mp4_path, hevc_path)
+        })
+        .clone()
 }
 
 fn probe_packet_info(mp4_path: &Path) -> Vec<(i64, bool)> {
