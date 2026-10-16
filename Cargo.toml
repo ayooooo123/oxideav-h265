@@ -18,3 +18,6 @@ exclude = ["/tests", "/fuzz"]
 
 [dependencies]
 oxideav-core = "0.1"
+
+[patch.crates-io]
+oxideav-core = { git = "https://github.com/ayooooo123/oxideav-core", rev = "9a314bf862480d019dc1133847ff6262d14ba628" }
