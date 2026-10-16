@@ -173,6 +173,8 @@ pub struct DecodedFrame {
     pub view_id: u16,
     /// Index of the access unit the picture belongs to (decode order).
     pub au_index: u64,
+    /// Packet PTS associated with the access unit that carried this picture.
+    pub pts: Option<i64>,
 }
 
 /// A §7.4.3.2.1 output cropping rectangle in luma samples: the
@@ -267,6 +269,7 @@ struct SegmentData {
     /// expressed in this byte space.
     escaped: Vec<u8>,
     header: SliceSegmentHeader,
+    pts: Option<i64>,
 }
 
 /// Which layers of an Annex F multi-layer bitstream to decode and
@@ -466,6 +469,10 @@ pub struct SequenceDecoder {
     /// §C.5.2.2 `no_output_of_prior_pics_flag`: an IRAP signaled or
     /// inferred discarding of prior unoutput pictures in the DPB.
     no_output_prior: bool,
+    /// PTS of the packet currently being fed.
+    packet_pts: Option<i64>,
+    /// PTS values of pictures that were skipped or dropped without output.
+    skipped_pts: Vec<i64>,
 }
 
 /// The sample planes and motion fields of pictures that left the DPB
@@ -691,6 +698,11 @@ impl SequenceDecoder {
                 pps,
                 layer_ctx.as_ref(),
             )?;
+            let pts = if first_in_pic {
+                self.packet_pts.take()
+            } else {
+                None
+            };
             self.pending.push(SegmentData {
                 nal_type: header.nal_unit_type,
                 temporal_id: header.temporal_id,
@@ -698,6 +710,7 @@ impl SequenceDecoder {
                 rbsp,
                 escaped,
                 header: parsed,
+                pts,
             });
             return Ok(());
         }
@@ -827,6 +840,8 @@ impl SequenceDecoder {
         for layer in self.layers.values_mut() {
             *layer = LayerState::default();
         }
+        self.packet_pts = None;
+        self.skipped_pts.clear();
         Ok(())
     }
 
@@ -839,6 +854,16 @@ impl SequenceDecoder {
     /// Whether an IRAP picture signaled discarding prior unoutput pictures.
     pub fn take_no_output_prior(&mut self) -> bool {
         std::mem::take(&mut self.no_output_prior)
+    }
+
+    /// Set the packet-level PTS for the upcoming access unit.
+    pub fn set_packet_pts(&mut self, pts: Option<i64>) {
+        self.packet_pts = pts;
+    }
+
+    /// Take any PTS values of pictures that were skipped or dropped without output.
+    pub fn take_skipped_pts(&mut self) -> Vec<i64> {
+        std::mem::take(&mut self.skipped_pts)
     }
     /// Keep an output plane for later pictures once nothing else shares
     /// it (a shared one is simply released).
@@ -890,6 +915,7 @@ impl SequenceDecoder {
 
     fn decode_picture(&mut self, segs: &[SegmentData]) -> Result<(), SequenceError> {
         let indep = &segs[0];
+        let pic_pts = indep.pts;
         if indep.header.dependent_slice_segment_flag {
             return Err(SequenceError::Malformed(
                 "first slice segment of a picture is dependent",
@@ -903,6 +929,9 @@ impl SequenceDecoder {
         // A RASL picture preceding any decoded picture in its layer cannot
         // be decoded either.
         if nal_kind.is_rasl() && (lstate.last_cra_no_rasl || !lstate.first_pic_decoded) {
+            if let Some(pts) = pic_pts {
+                self.skipped_pts.push(pts);
+            }
             return Ok(());
         }
         let plan = self.plan();
@@ -1025,7 +1054,12 @@ impl SequenceDecoder {
                 .collect();
             for f in &mut self.frames {
                 if f.layer_id == layer_id && dpb_pocs.contains(&f.poc) {
-                    f.output = false;
+                    if f.output {
+                        f.output = false;
+                        if let Some(pts) = f.pts {
+                            self.skipped_pts.push(pts);
+                        }
+                    }
                 }
             }
             self.state.dpb_mut().unmark_layer(layer_id);
@@ -1427,6 +1461,7 @@ impl SequenceDecoder {
             layer_id,
             view_id,
             au_index: self.au.index,
+            pts: pic_pts,
         });
         // A one-picture DPB (`sps_max_dec_pic_buffering_minus1 == 0`:
         // every still, and any intra-only sequence signalling it) must
@@ -1671,6 +1706,7 @@ pub fn decode_annexb_sequence_debug(
                 rbsp: unit.rbsp,
                 escaped: unit.escaped,
                 header: parsed,
+                pts: None,
             });
         } else {
             dec.push_nal_unit(unit)?;
@@ -1735,6 +1771,7 @@ pub fn decode_annexb_first_picture_tolerant(data: &[u8]) -> Result<Picture, Sequ
                 rbsp: unit.rbsp,
                 escaped: unit.escaped,
                 header: parsed,
+                pts: None,
             });
         } else {
             dec.push_nal_unit(unit)?;

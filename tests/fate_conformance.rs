@@ -10,7 +10,10 @@ use std::{
     process::Command,
 };
 
-fn receive(decoder: &mut dyn Decoder, hashes: &mut Vec<String>) -> Result<(), String> {
+fn receive_frames(
+    decoder: &mut dyn Decoder,
+    out: &mut Vec<(Option<i64>, String)>,
+) -> Result<(), String> {
     loop {
         match decoder.receive_frame() {
             Ok(Frame::Video(frame)) => {
@@ -18,13 +21,20 @@ fn receive(decoder: &mut dyn Decoder, hashes: &mut Vec<String>) -> Result<(), St
                 for plane in frame.planes {
                     bytes.extend(plane.data);
                 }
-                hashes.push(fixture_bytes::md5::hex(&bytes));
+                out.push((frame.pts, fixture_bytes::md5::hex(&bytes)));
             }
             Ok(_) => return Err("non-video frame".into()),
             Err(Error::NeedMore | Error::Eof) => return Ok(()),
             Err(error) => return Err(error.to_string()),
         }
     }
+}
+
+fn receive(decoder: &mut dyn Decoder, hashes: &mut Vec<String>) -> Result<(), String> {
+    let mut frames = Vec::new();
+    receive_frames(decoder, &mut frames)?;
+    hashes.extend(frames.into_iter().map(|(_, h)| h));
+    Ok(())
 }
 
 fn decode(data: &[u8], threads: usize) -> Result<Vec<String>, String> {
@@ -213,8 +223,8 @@ fn decode_from_midstream_cra_after_reset_matches_ffmpeg() {
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target"));
     let dir = root.join("hevc-cra-repro");
-    fs::create_dir_all(&dir).unwrap();
-    let stream_path = dir.join("open_gop_repro.hevc");
+    let mp4_path = dir.join("open_gop_repro.mp4");
+    let hevc_path = dir.join("open_gop_repro.hevc");
     let status = Command::new("ffmpeg")
         .args([
             "-nostdin",
@@ -231,17 +241,89 @@ fn decode_from_midstream_cra_after_reset_matches_ffmpeg() {
             "libx265",
             "-x265-params",
             "keyint=25:min-keyint=25:open-gop=1:bframes=3",
-            "-f",
-            "hevc",
+            "-tag:v",
+            "hvc1",
         ])
-        .arg(&stream_path)
+        .arg(&mp4_path)
         .status()
         .expect("ffmpeg with libx265 required");
     assert!(status.success(), "ffmpeg generated open-GOP stream");
 
-    let data = fs::read(&stream_path).unwrap();
+    let status_hevc = Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-y", "-i"])
+        .arg(&mp4_path)
+        .args(["-c:v", "copy", "-f", "hevc"])
+        .arg(&hevc_path)
+        .status()
+        .expect("ffmpeg extract hevc");
+    assert!(status_hevc.success());
 
-    // Split stream into Annex B NAL chunks and find the second CRA access unit.
+    // Query packet PTS and keyframe flags from the container.
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v",
+            "-show_entries",
+            "packet=pts,flags",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(&mp4_path)
+        .output()
+        .expect("ffprobe packet probe");
+    assert!(probe.status.success());
+    let probe_text = String::from_utf8(probe.stdout).unwrap();
+    let packet_info: Vec<(i64, bool)> = probe_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let mut parts = l.split(',');
+            let raw_pts: i64 = parts.next().unwrap().trim().parse().unwrap();
+            let flags = parts.next().unwrap_or("").trim();
+            (raw_pts / 512, flags.contains('K'))
+        })
+        .collect();
+
+    // Query expected frame PTS and hashes from FFmpeg oracle.
+    let oracle = Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-copyts", "-i"])
+        .arg(&mp4_path)
+        .args(["-f", "framemd5", "-"])
+        .output()
+        .expect("ffmpeg oracle");
+    assert!(oracle.status.success());
+    let oracle_text = String::from_utf8(oracle.stdout).unwrap();
+    let all_expected: Vec<(i64, String)> = oracle_text
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .map(|l| {
+            let parts: Vec<&str> = l.split(',').collect();
+            let pts: i64 = parts[2].trim().parse().unwrap();
+            let hash = parts[5].trim().to_owned();
+            (pts, hash)
+        })
+        .collect();
+
+    // Locate the second keyframe (CRA) in packet_info.
+    let cra_idx = packet_info
+        .iter()
+        .enumerate()
+        .filter(|(idx, (_, is_key))| *idx > 0 && *is_key)
+        .map(|(idx, _)| idx)
+        .next()
+        .expect("second keyframe / CRA");
+    let cra_target_pts = packet_info[cra_idx].0;
+    let expected: Vec<(Option<i64>, String)> = all_expected
+        .into_iter()
+        .filter(|(pts, _)| *pts >= cra_target_pts)
+        .map(|(pts, hash)| (Some(pts), hash))
+        .collect();
+    assert!(!expected.is_empty(), "FFmpeg produced output frames from CRA");
+
+    // Split the raw Annex B stream into access units.
+    let data = fs::read(&hevc_path).unwrap();
     let mut starts: Vec<usize> = Vec::new();
     let mut i = 0;
     while i < data.len().saturating_sub(2) {
@@ -257,108 +339,59 @@ fn decode_from_midstream_cra_after_reset_matches_ffmpeg() {
     }
     starts.push(data.len());
 
-    // Locate the second CRA (nal_type == 21) and its preceding parameter sets.
-    let mut cra_count = 0;
-    let mut cra_offset = None;
-    for &offset in &starts[..starts.len() - 1] {
-        let sc = if data[offset..].starts_with(&[0, 0, 0, 1]) { 4 } else { 3 };
-        let nal_type = (data[offset + sc] >> 1) & 0x3f;
-        if nal_type == 32 && cra_count == 1 && cra_offset.is_none() {
-            cra_offset = Some(offset);
-        } else if nal_type == 21 {
-            cra_count += 1;
-            if cra_count == 2 && cra_offset.is_none() {
-                cra_offset = Some(offset);
+    let mut au_starts: Vec<usize> = Vec::new();
+    let mut in_ps = false;
+    for &off in &starts[..starts.len() - 1] {
+        let sc = if data[off..].starts_with(&[0, 0, 0, 1]) { 4 } else { 3 };
+        let nal_type = (data[off + sc] >> 1) & 0x3f;
+        let rbsp = &data[off + sc + 2..];
+        let first = if !rbsp.is_empty() { (rbsp[0] >> 7) & 1 } else { 0 };
+        if nal_type == 32 || nal_type == 35 {
+            au_starts.push(off);
+            in_ps = true;
+        } else if nal_type < 32 && first == 1 {
+            if in_ps {
+                in_ps = false;
+            } else {
+                au_starts.push(off);
             }
         }
     }
-    let cra_offset = cra_offset.expect("found second CRA access unit in stream");
-    let cra_data = &data[cra_offset..];
+    au_starts.push(data.len());
+    assert_eq!(au_starts.len() - 1, packet_info.len(), "AU count matches packet count");
 
-    // Compute oracle hashes from FFmpeg starting from that CRA point.
-    let mut oracle_cmd = Command::new("ffmpeg")
-        .args([
-            "-v",
-            "error",
-            "-nostdin",
-            "-threads",
-            "1",
-            "-f",
-            "hevc",
-            "-i",
-            "-",
-            "-fps_mode",
-            "passthrough",
-            "-pix_fmt",
-            "yuv420p",
-            "-f",
-            "framemd5",
-            "-",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("ffmpeg oracle process");
-    {
-        use std::io::Write;
-        let mut stdin = oracle_cmd.stdin.take().unwrap();
-        stdin.write_all(cra_data).unwrap();
-    }
-    let oracle_output = oracle_cmd.wait_with_output().unwrap();
-    assert!(oracle_output.status.success(), "ffmpeg oracle decode");
-    let oracle_text = String::from_utf8(oracle_output.stdout).unwrap();
-    let expected: Vec<String> = oracle_text
-        .lines()
-        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
-        .map(|l| l.rsplit(',').next().unwrap().trim().to_owned())
-        .collect();
-    assert!(!expected.is_empty(), "FFmpeg produced output frames from CRA");
-
-    // Test: decode stream up to the midstream CRA, call reset(), then decode from CRA.
+    // Create decoder, decode initial GOP before CRA, then reset().
     let mut decoder = oxideav_h265::make_decoder(&CodecParameters::video("h265".into()))
         .expect("make_decoder");
 
-    // Feed initial packets before the CRA.
-    let pre_cra = &data[..cra_offset];
-    let _ = decoder.send_packet(&Packet::new(0, TimeBase::new(1, 25), pre_cra.to_vec()));
-    let mut pre_hashes = Vec::new();
-    let _ = receive(decoder.as_mut(), &mut pre_hashes);
+    for idx in 0..cra_idx {
+        let au = &data[au_starts[idx]..au_starts[idx + 1]];
+        let mut pkt = Packet::new(0, TimeBase::new(1, 25), au.to_vec());
+        pkt.pts = Some(packet_info[idx].0);
+        let _ = decoder.send_packet(&pkt);
+        let mut pre_frames = Vec::new();
+        let _ = receive_frames(decoder.as_mut(), &mut pre_frames);
+    }
 
-    // Seek / reset onto the CRA.
+    // Reset at seek point onto the CRA.
     decoder.reset().expect("decoder reset succeeds");
 
-    // Feed the stream starting from the CRA.
-    let mut cra_starts: Vec<usize> = Vec::new();
-    let mut j = 0;
-    while j < cra_data.len().saturating_sub(2) {
-        if cra_data[j..].starts_with(&[0, 0, 1]) {
-            cra_starts.push(j);
-            j += 3;
-        } else if cra_data[j..].starts_with(&[0, 0, 0, 1]) {
-            cra_starts.push(j);
-            j += 4;
-        } else {
-            j += 1;
-        }
-    }
-    cra_starts.push(cra_data.len());
-
-    let mut actual_hashes = Vec::new();
-    for offsets in cra_starts.windows(2) {
+    // Feed from the CRA onwards, each packet stamped with its container PTS.
+    let mut actual = Vec::new();
+    for idx in cra_idx..packet_info.len() {
+        let au = &data[au_starts[idx]..au_starts[idx + 1]];
+        let mut pkt = Packet::new(0, TimeBase::new(1, 25), au.to_vec());
+        pkt.pts = Some(packet_info[idx].0);
         decoder
-            .send_packet(&Packet::new(
-                0,
-                TimeBase::new(1, 25),
-                cra_data[offsets[0]..offsets[1]].to_vec(),
-            ))
+            .send_packet(&pkt)
             .expect("send_packet succeeds from CRA");
-        receive(decoder.as_mut(), &mut actual_hashes).expect("receive frames");
+        receive_frames(decoder.as_mut(), &mut actual).expect("receive frames");
     }
     decoder.flush().expect("decoder flush");
-    receive(decoder.as_mut(), &mut actual_hashes).expect("receive flushed frames");
+    receive_frames(decoder.as_mut(), &mut actual).expect("receive flushed frames");
 
     assert_eq!(
-        actual_hashes, expected,
-        "decoded frames from mid-stream CRA after reset must match FFmpeg byte-exact"
+        actual, expected,
+        "decoded frames from mid-stream CRA after reset must match FFmpeg pixels and PTS byte-exact"
     );
 }
