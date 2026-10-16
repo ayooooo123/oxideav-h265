@@ -12,10 +12,10 @@
 //! §8.3.3.1), length-prefixed NAL runs as ISO-BMFF samples carry them.
 //! Extradata in either form is fed ahead of the first packet so
 //! out-of-band parameter sets activate. Output frames come in output
-//! (PicOrderCntVal) order, with packet PTS values re-attached in
-//! ascending order; an empty packet flushes the reorder queue.
+//! (PicOrderCntVal) order, carrying the PTS of the packet that began
+//! their access unit (or None if untimed or consumed by an earlier AU);
+//! an empty packet flushes the reorder queue.
 
-use std::collections::BinaryHeap;
 use std::collections::VecDeque;
 
 use oxideav_core::{
@@ -44,8 +44,6 @@ pub struct H265Decoder {
     ready: VecDeque<(Frame, Layout)>,
     /// The [`Layout`] of the frame `receive_frame` last returned.
     last_output: Option<Layout>,
-    /// Min-heap of packet PTS values, re-attached in output order.
-    pts_queue: BinaryHeap<std::cmp::Reverse<i64>>,
     /// `Some(n)` when the extradata was an `hvcC` record: packets are
     /// length-prefixed NAL runs with `n`-byte big-endian sizes
     /// (ISO/IEC 14496-15 §8.3.3.1.3 `lengthSizeMinusOne + 1`).
@@ -155,7 +153,6 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         reorder: Vec::new(),
         ready: VecDeque::new(),
         last_output: None,
-        pts_queue: BinaryHeap::new(),
         nal_length_size,
         flushed: false,
     }))
@@ -166,16 +163,8 @@ impl H265Decoder {
     /// frame that is guaranteed next in output order.
     fn drain(&mut self, flush: bool) {
         self.reorder.extend(self.seq.take_decoded());
-        for pts in self.seq.take_skipped_pts() {
-            remove_one_pts(&mut self.pts_queue, pts);
-        }
         if self.seq.take_no_output_prior() {
             let cur_cvs = self.seq.cvs_index();
-            for f in self.reorder.iter().filter(|f| f.cvs_index < cur_cvs) {
-                if let Some(pts) = f.pts {
-                    remove_one_pts(&mut self.pts_queue, pts);
-                }
-            }
             self.reorder.retain(|f| f.cvs_index >= cur_cvs);
         }
         // Output order: POC within a CVS, the layers of one access unit
@@ -200,9 +189,6 @@ impl H265Decoder {
         while self.reorder.len() > depth {
             let f = self.reorder.remove(0);
             if !f.output {
-                if let Some(pts) = f.pts {
-                    remove_one_pts(&mut self.pts_queue, pts);
-                }
                 if recycle {
                     for plane in f.picture.into_shared_planes() {
                         self.seq.recycle_plane(plane);
@@ -210,16 +196,10 @@ impl H265Decoder {
                 }
                 continue;
             }
-            let pts = if let Some(pts) = f.pts {
-                remove_one_pts(&mut self.pts_queue, pts);
-                Some(pts)
-            } else {
-                self.pts_queue.pop().map(|r| r.0)
-            };
             let layout = frame_layout(&f.picture, &f.crop);
             // §7.4.3.2.1 — output the conformance-cropped picture,
             // packed straight from the decoded planes.
-            let frame = video_frame_owned(f.picture, &f.crop, pts, |plane| {
+            let frame = video_frame_owned(f.picture, &f.crop, f.pts, |plane| {
                 if recycle {
                     self.seq.recycle_plane(plane);
                 }
@@ -254,9 +234,6 @@ impl Decoder for H265Decoder {
             return self.flush();
         }
         self.flushed = false;
-        if let Some(pts) = packet.pts {
-            self.pts_queue.push(std::cmp::Reverse(pts));
-        }
         self.seq.set_packet_pts(packet.pts);
         if let Some(length_size) = self.nal_length_size {
             let units = split_length_prefixed(&packet.data, length_size)
@@ -321,7 +298,6 @@ impl Decoder for H265Decoder {
     }
 
     fn reset(&mut self) -> Result<()> {
-        self.pts_queue.clear();
         self.ready.clear();
         self.reorder.clear();
         self.flushed = false;
@@ -333,18 +309,6 @@ impl Decoder for H265Decoder {
     }
 }
 
-/// Remove exactly one occurrence of `target` from `heap`.
-fn remove_one_pts(heap: &mut BinaryHeap<std::cmp::Reverse<i64>>, target: i64) {
-    let mut removed = false;
-    heap.retain(|&std::cmp::Reverse(p)| {
-        if !removed && p == target {
-            removed = true;
-            false
-        } else {
-            true
-        }
-    });
-}
 
 /// The visible size and pixel layout of an output frame: `None` dimensions
 /// for an empty cropped window, `None` layout where no [`PixelFormat`]

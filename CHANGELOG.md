@@ -76,6 +76,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Frame presentation timestamp (PTS) contract: each output frame carries
+  exactly the PTS of the packet that began its access unit, or None if the
+  packet was untimed or an earlier access unit in the same packet took it.
+  All layers of one access unit share its PTS. Untimed pictures no longer pop
+  timestamps from later pictures in the reorder queue.
+- When a CRA starts decoding (such as after seeking), its associated RASL
+  pictures are skipped. End-of-sequence (EOS) and end-of-bitstream (EOB) NAL
+  units are handled; a CRA following an EOS infers `no_output_of_prior_pics`,
+  dropping prior unoutput pictures as in FFmpeg.
+- `Decoder::reset()` now resets access-unit and picture-order-count (POC)
+  state so resuming from a seek point derives POC afresh.
 - A picture that activates a changed SPS (another id, or the same id
   re-sent with other bytes) now first marks its layer's reference pictures
   unused, as FFmpeg does; re-sending the same bytes keeps them. Bytes are

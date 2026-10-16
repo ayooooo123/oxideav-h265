@@ -217,48 +217,48 @@ fn original_fate_main_main10_and_rext_complete_output() {
     );
 }
 
-#[test]
-fn decode_from_midstream_cra_after_reset_matches_ffmpeg() {
-    let root = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target"));
-    let dir = root.join("hevc-cra-repro");
+fn ensure_open_gop_stream(dir: &Path) -> (PathBuf, PathBuf) {
+    fs::create_dir_all(dir).expect("create dir");
     let mp4_path = dir.join("open_gop_repro.mp4");
     let hevc_path = dir.join("open_gop_repro.hevc");
-    let status = Command::new("ffmpeg")
-        .args([
-            "-nostdin",
-            "-v",
-            "error",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=320x240:rate=25",
-            "-t",
-            "4",
-            "-c:v",
-            "libx265",
-            "-x265-params",
-            "keyint=25:min-keyint=25:open-gop=1:bframes=3",
-            "-tag:v",
-            "hvc1",
-        ])
-        .arg(&mp4_path)
-        .status()
-        .expect("ffmpeg with libx265 required");
-    assert!(status.success(), "ffmpeg generated open-GOP stream");
+    if !mp4_path.exists() || !hevc_path.exists() {
+        let status = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=25",
+                "-t",
+                "4",
+                "-c:v",
+                "libx265",
+                "-x265-params",
+                "keyint=25:min-keyint=25:open-gop=1:bframes=3",
+                "-tag:v",
+                "hvc1",
+            ])
+            .arg(&mp4_path)
+            .status()
+            .expect("ffmpeg with libx265 required");
+        assert!(status.success(), "ffmpeg generated open-GOP stream");
 
-    let status_hevc = Command::new("ffmpeg")
-        .args(["-nostdin", "-v", "error", "-y", "-i"])
-        .arg(&mp4_path)
-        .args(["-c:v", "copy", "-f", "hevc"])
-        .arg(&hevc_path)
-        .status()
-        .expect("ffmpeg extract hevc");
-    assert!(status_hevc.success());
+        let status_hevc = Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-y", "-i"])
+            .arg(&mp4_path)
+            .args(["-c:v", "copy", "-f", "hevc"])
+            .arg(&hevc_path)
+            .status()
+            .expect("ffmpeg extract hevc");
+        assert!(status_hevc.success());
+    }
+    (mp4_path, hevc_path)
+}
 
-    // Query packet PTS and keyframe flags from the container.
+fn probe_packet_info(mp4_path: &Path) -> Vec<(i64, bool)> {
     let probe = Command::new("ffprobe")
         .args([
             "-v",
@@ -270,12 +270,12 @@ fn decode_from_midstream_cra_after_reset_matches_ffmpeg() {
             "-of",
             "csv=p=0",
         ])
-        .arg(&mp4_path)
+        .arg(mp4_path)
         .output()
         .expect("ffprobe packet probe");
     assert!(probe.status.success());
     let probe_text = String::from_utf8(probe.stdout).unwrap();
-    let packet_info: Vec<(i64, bool)> = probe_text
+    probe_text
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| {
@@ -284,18 +284,19 @@ fn decode_from_midstream_cra_after_reset_matches_ffmpeg() {
             let flags = parts.next().unwrap_or("").trim();
             (raw_pts / 512, flags.contains('K'))
         })
-        .collect();
+        .collect()
+}
 
-    // Query expected frame PTS and hashes from FFmpeg oracle.
+fn oracle_framemd5(input_path: &Path) -> Vec<(i64, String)> {
     let oracle = Command::new("ffmpeg")
         .args(["-v", "error", "-nostdin", "-copyts", "-i"])
-        .arg(&mp4_path)
+        .arg(input_path)
         .args(["-f", "framemd5", "-"])
         .output()
         .expect("ffmpeg oracle");
     assert!(oracle.status.success());
     let oracle_text = String::from_utf8(oracle.stdout).unwrap();
-    let all_expected: Vec<(i64, String)> = oracle_text
+    oracle_text
         .lines()
         .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
         .map(|l| {
@@ -304,26 +305,10 @@ fn decode_from_midstream_cra_after_reset_matches_ffmpeg() {
             let hash = parts[5].trim().to_owned();
             (pts, hash)
         })
-        .collect();
+        .collect()
+}
 
-    // Locate the second keyframe (CRA) in packet_info.
-    let cra_idx = packet_info
-        .iter()
-        .enumerate()
-        .filter(|(idx, (_, is_key))| *idx > 0 && *is_key)
-        .map(|(idx, _)| idx)
-        .next()
-        .expect("second keyframe / CRA");
-    let cra_target_pts = packet_info[cra_idx].0;
-    let expected: Vec<(Option<i64>, String)> = all_expected
-        .into_iter()
-        .filter(|(pts, _)| *pts >= cra_target_pts)
-        .map(|(pts, hash)| (Some(pts), hash))
-        .collect();
-    assert!(!expected.is_empty(), "FFmpeg produced output frames from CRA");
-
-    // Split the raw Annex B stream into access units.
-    let data = fs::read(&hevc_path).unwrap();
+fn split_access_units(data: &[u8]) -> Vec<usize> {
     let mut starts: Vec<usize> = Vec::new();
     let mut i = 0;
     while i < data.len().saturating_sub(2) {
@@ -358,6 +343,39 @@ fn decode_from_midstream_cra_after_reset_matches_ffmpeg() {
         }
     }
     au_starts.push(data.len());
+    au_starts
+}
+
+#[test]
+fn decode_from_midstream_cra_after_reset_matches_ffmpeg() {
+    let root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target"));
+    let dir = root.join("hevc-cra-repro");
+    fs::create_dir_all(&dir).unwrap();
+    let (mp4_path, hevc_path) = ensure_open_gop_stream(&dir);
+
+    let packet_info = probe_packet_info(&mp4_path);
+    let all_expected = oracle_framemd5(&mp4_path);
+
+    // Locate the second keyframe (CRA) in packet_info.
+    let cra_idx = packet_info
+        .iter()
+        .enumerate()
+        .filter(|(idx, (_, is_key))| *idx > 0 && *is_key)
+        .map(|(idx, _)| idx)
+        .next()
+        .expect("second keyframe / CRA");
+    let cra_target_pts = packet_info[cra_idx].0;
+    let expected: Vec<(Option<i64>, String)> = all_expected
+        .into_iter()
+        .filter(|(pts, _)| *pts >= cra_target_pts)
+        .map(|(pts, hash)| (Some(pts), hash))
+        .collect();
+    assert!(!expected.is_empty(), "FFmpeg produced output frames from CRA");
+
+    let data = fs::read(&hevc_path).unwrap();
+    let au_starts = split_access_units(&data);
     assert_eq!(au_starts.len() - 1, packet_info.len(), "AU count matches packet count");
 
     // Create decoder, decode initial GOP before CRA, then reset().
@@ -368,9 +386,9 @@ fn decode_from_midstream_cra_after_reset_matches_ffmpeg() {
         let au = &data[au_starts[idx]..au_starts[idx + 1]];
         let mut pkt = Packet::new(0, TimeBase::new(1, 25), au.to_vec());
         pkt.pts = Some(packet_info[idx].0);
-        let _ = decoder.send_packet(&pkt);
+        decoder.send_packet(&pkt).expect("pre-reset send_packet");
         let mut pre_frames = Vec::new();
-        let _ = receive_frames(decoder.as_mut(), &mut pre_frames);
+        receive_frames(decoder.as_mut(), &mut pre_frames).expect("pre-reset receive_frames");
     }
 
     // Reset at seek point onto the CRA.
@@ -394,4 +412,267 @@ fn decode_from_midstream_cra_after_reset_matches_ffmpeg() {
         actual, expected,
         "decoded frames from mid-stream CRA after reset must match FFmpeg pixels and PTS byte-exact"
     );
+}
+
+#[test]
+fn untimed_b_frame_pair_packets_produce_none_pts_frames() {
+    let root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target"));
+    let dir = root.join("hevc-cra-repro");
+    fs::create_dir_all(&dir).unwrap();
+    let (mp4_path, hevc_path) = ensure_open_gop_stream(&dir);
+
+    let packet_info = probe_packet_info(&mp4_path);
+    let all_expected = oracle_framemd5(&mp4_path);
+
+    let cras: Vec<usize> = packet_info
+        .iter()
+        .enumerate()
+        .filter(|(idx, (_, is_key))| *idx > 0 && *is_key)
+        .map(|(idx, _)| idx)
+        .collect();
+    let second_cra = cras[1]; // 0 is first CRA, 1 is second CRA
+
+    // Find two consecutive packets after the second CRA whose pts run backwards (a B-frame pair).
+    let (p1, p2) = (second_cra + 1..packet_info.len() - 1)
+        .find(|&i| packet_info[i].0 > packet_info[i + 1].0)
+        .map(|i| (i, i + 1))
+        .expect("consecutive packets whose pts run backwards");
+
+    let untimed_pts = [packet_info[p1].0, packet_info[p2].0];
+    let expected: Vec<(Option<i64>, String)> = all_expected
+        .into_iter()
+        .map(|(pts, hash)| {
+            if untimed_pts.contains(&pts) {
+                (None, hash)
+            } else {
+                (Some(pts), hash)
+            }
+        })
+        .collect();
+
+    let data = fs::read(&hevc_path).unwrap();
+    let au_starts = split_access_units(&data);
+    assert_eq!(au_starts.len() - 1, packet_info.len());
+
+    let mut decoder = oxideav_h265::make_decoder(&CodecParameters::video("h265".into()))
+        .expect("make_decoder");
+    let mut actual = Vec::new();
+
+    for idx in 0..packet_info.len() {
+        let au = &data[au_starts[idx]..au_starts[idx + 1]];
+        let mut pkt = Packet::new(0, TimeBase::new(1, 25), au.to_vec());
+        if idx == p1 || idx == p2 {
+            pkt.pts = None;
+        } else {
+            pkt.pts = Some(packet_info[idx].0);
+        }
+        decoder.send_packet(&pkt).expect("send_packet");
+        receive_frames(decoder.as_mut(), &mut actual).expect("receive_frames");
+    }
+    decoder.flush().expect("flush");
+    receive_frames(decoder.as_mut(), &mut actual).expect("receive_frames flush");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn two_access_units_in_one_packet_attaches_pts_only_to_first_au() {
+    let root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target"));
+    let dir = root.join("hevc-cra-repro");
+    fs::create_dir_all(&dir).unwrap();
+    let (mp4_path, hevc_path) = ensure_open_gop_stream(&dir);
+
+    let packet_info = probe_packet_info(&mp4_path);
+    let all_expected = oracle_framemd5(&mp4_path);
+
+    let data = fs::read(&hevc_path).unwrap();
+    let au_starts = split_access_units(&data);
+    assert_eq!(au_starts.len() - 1, packet_info.len());
+
+    // Merge AU j and j+1 into one packet carrying AU j's pts.
+    let j = 30;
+    let untimed_pts = packet_info[j + 1].0;
+    let expected: Vec<(Option<i64>, String)> = all_expected
+        .into_iter()
+        .map(|(pts, hash)| {
+            if pts == untimed_pts {
+                (None, hash)
+            } else {
+                (Some(pts), hash)
+            }
+        })
+        .collect();
+
+    let mut decoder = oxideav_h265::make_decoder(&CodecParameters::video("h265".into()))
+        .expect("make_decoder");
+    let mut actual = Vec::new();
+
+    let mut idx = 0;
+    while idx < packet_info.len() {
+        if idx == j {
+            let mut merged = data[au_starts[j]..au_starts[j + 1]].to_vec();
+            merged.extend_from_slice(&data[au_starts[j + 1]..au_starts[j + 2]]);
+            let mut pkt = Packet::new(0, TimeBase::new(1, 25), merged);
+            pkt.pts = Some(packet_info[j].0);
+            decoder.send_packet(&pkt).expect("send merged packet");
+            receive_frames(decoder.as_mut(), &mut actual).expect("receive_frames");
+            idx += 2;
+        } else {
+            let au = &data[au_starts[idx]..au_starts[idx + 1]];
+            let mut pkt = Packet::new(0, TimeBase::new(1, 25), au.to_vec());
+            pkt.pts = Some(packet_info[idx].0);
+            decoder.send_packet(&pkt).expect("send packet");
+            receive_frames(decoder.as_mut(), &mut actual).expect("receive_frames");
+            idx += 1;
+        }
+    }
+    decoder.flush().expect("flush");
+    receive_frames(decoder.as_mut(), &mut actual).expect("receive_frames flush");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn eos_nal_before_third_cra_drops_prior_pictures_and_preserves_pts() {
+    let root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target"));
+    let dir = root.join("hevc-cra-repro");
+    fs::create_dir_all(&dir).unwrap();
+    let (mp4_path, hevc_path) = ensure_open_gop_stream(&dir);
+
+    let packet_info = probe_packet_info(&mp4_path);
+    let all_expected = oracle_framemd5(&mp4_path);
+
+    let cras: Vec<usize> = packet_info
+        .iter()
+        .enumerate()
+        .filter(|(idx, (_, is_key))| *idx > 0 && *is_key)
+        .map(|(idx, _)| idx)
+        .collect();
+    let third_cra = cras[2]; // 0 is first CRA, 1 is second CRA, 2 is third CRA
+
+    let data = fs::read(&hevc_path).unwrap();
+    let au_starts = split_access_units(&data);
+    assert_eq!(au_starts.len() - 1, packet_info.len());
+
+    // Append EOS NAL (00 00 01 48 01) to the AU before the third CRA.
+    let mut modified_hevc = Vec::new();
+    let mut packets = Vec::new();
+    for idx in 0..packet_info.len() {
+        let mut au = data[au_starts[idx]..au_starts[idx + 1]].to_vec();
+        if idx == third_cra - 1 {
+            au.extend_from_slice(&[0, 0, 1, 0x48, 0x01]);
+        }
+        modified_hevc.extend_from_slice(&au);
+        let mut pkt = Packet::new(0, TimeBase::new(1, 25), au);
+        pkt.pts = Some(packet_info[idx].0);
+        packets.push(pkt);
+    }
+
+    let modified_path = dir.join("open_gop_repro_eos.hevc");
+    fs::write(&modified_path, &modified_hevc).expect("write modified hevc");
+
+    let ffmpeg_modified = oracle_framemd5(&modified_path);
+    let modified_hashes: std::collections::HashSet<String> =
+        ffmpeg_modified.into_iter().map(|(_, h)| h).collect();
+
+    // Assert the oracle md5s are unique.
+    let mut unique_hashes = std::collections::HashSet::new();
+    for (_, h) in &all_expected {
+        assert!(unique_hashes.insert(h.clone()), "oracle hashes must be unique");
+    }
+
+    let expected: Vec<(Option<i64>, String)> = all_expected
+        .into_iter()
+        .filter(|(_, h)| modified_hashes.contains(h))
+        .map(|(pts, h)| (Some(pts), h))
+        .collect();
+
+    let mut decoder = oxideav_h265::make_decoder(&CodecParameters::video("h265".into()))
+        .expect("make_decoder");
+    let mut actual = Vec::new();
+    for pkt in &packets {
+        decoder.send_packet(pkt).expect("send packet");
+        receive_frames(decoder.as_mut(), &mut actual).expect("receive_frames");
+    }
+    decoder.flush().expect("flush");
+    receive_frames(decoder.as_mut(), &mut actual).expect("receive_frames flush");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn mvhevc_both_views_of_access_unit_carry_that_access_unit_pts() {
+    const STREAM: &[u8] = include_bytes!("fixture_bytes/r462-mvhevc-3au.hevc");
+    let data = STREAM;
+
+    let mut starts: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i + 2 < data.len() {
+        if data[i..].starts_with(&[0, 0, 1]) {
+            starts.push(i);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    starts.push(data.len());
+
+    let mut au = Vec::new();
+    let mut pending_non_vcl: Option<usize> = None;
+    for &off in &starts[..starts.len() - 1] {
+        let b0 = data[off + 3];
+        let b1 = data[off + 4];
+        let nal_type = (b0 >> 1) & 0x3f;
+        let layer = ((b0 & 1) << 5) | (b1 >> 3);
+        let first = (data[off + 5] >> 7) & 1;
+        if nal_type >= 32 {
+            if nal_type != 36 && nal_type != 37 && nal_type != 40 {
+                pending_non_vcl.get_or_insert(off);
+            }
+        } else {
+            if first == 1 && layer == 0 {
+                au.push(pending_non_vcl.unwrap_or(off));
+            }
+            pending_non_vcl = None;
+        }
+    }
+    au.push(data.len());
+    assert_eq!(au.len() - 1, 3, "three access units in MV-HEVC stream");
+
+    let mut decoder = oxideav_h265::make_decoder(&CodecParameters::video("h265".into()))
+        .expect("make_decoder");
+    let mut actual_pts = Vec::new();
+    for (n, w) in au.windows(2).enumerate() {
+        let mut pkt = Packet::new(0, TimeBase::new(1, 25), data[w[0]..w[1]].to_vec());
+        pkt.pts = Some(n as i64 * 10);
+        decoder.send_packet(&pkt).expect("send packet");
+        let mut frames = Vec::new();
+        receive_frames(decoder.as_mut(), &mut frames).expect("receive frames");
+        actual_pts.extend(frames.into_iter().map(|(pts, _)| pts));
+    }
+    decoder.flush().expect("flush");
+    let mut frames = Vec::new();
+    receive_frames(decoder.as_mut(), &mut frames).expect("receive frames flush");
+    actual_pts.extend(frames.into_iter().map(|(pts, _)| pts));
+
+    // Output order is POC order within CVS: AU 0 (POC 0), AU 2 (POC 1), AU 1 (POC 2).
+    // Both views (layer 0 and layer 1) of each AU must carry that AU's packet PTS.
+    let expected_pts = vec![
+        Some(0),
+        Some(0),
+        Some(20),
+        Some(20),
+        Some(10),
+        Some(10),
+    ];
+    assert_eq!(actual_pts, expected_pts, "both views of each AU must carry that AU's PTS");
+    for pair in actual_pts.chunks(2) {
+        assert_eq!(pair[0], pair[1], "both views in one AU must share the same PTS");
+    }
 }

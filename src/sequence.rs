@@ -425,6 +425,8 @@ struct AccessUnit {
     seen_vcl: bool,
     /// `poc_reset_period_id` of the current POC resetting period.
     poc_reset_period: Option<u8>,
+    /// PTS of the packet that began this access unit.
+    pts: Option<i64>,
 }
 
 /// The whole-bitstream decoder: parameter-set activation + per-picture
@@ -471,8 +473,6 @@ pub struct SequenceDecoder {
     no_output_prior: bool,
     /// PTS of the packet currently being fed.
     packet_pts: Option<i64>,
-    /// PTS values of pictures that were skipped or dropped without output.
-    skipped_pts: Vec<i64>,
 }
 
 /// The sample planes and motion fields of pictures that left the DPB
@@ -660,10 +660,13 @@ impl SequenceDecoder {
                 // access unit the next VCL NAL unit starts — they do
                 // not open one by themselves.)
                 let new_au = self.au.max_layer.map_or(true, |m| header.nuh_layer_id <= m);
-                if new_au && self.au.seen_vcl {
-                    self.au.index += 1;
-                    self.au.pictures.clear();
-                    self.au.max_layer = None;
+                if new_au {
+                    if self.au.seen_vcl {
+                        self.au.index += 1;
+                        self.au.pictures.clear();
+                        self.au.max_layer = None;
+                    }
+                    self.au.pts = self.packet_pts.take();
                 }
                 self.au.seen_vcl = true;
             }
@@ -699,7 +702,7 @@ impl SequenceDecoder {
                 layer_ctx.as_ref(),
             )?;
             let pts = if first_in_pic {
-                self.packet_pts.take()
+                self.au.pts
             } else {
                 None
             };
@@ -788,14 +791,11 @@ impl SequenceDecoder {
                 let pps = PicParameterSet::parse(&rbsp)?;
                 self.pps.insert(pps.pps_id, pps);
             }
-            NAL_EOS | NAL_EOB => {
-                if header.nuh_layer_id == 0 {
-                    self.finish_picture()?;
-                    self.eos_seen = true;
-                    self.au.seen_vcl = false;
-                    self.au.pictures.clear();
-                    self.au.max_layer = None;
-                }
+            NAL_EOS | NAL_EOB if header.nuh_layer_id == 0 => {
+                self.finish_picture()?;
+                self.eos_seen = true;
+                self.au.pictures.clear();
+                self.au.max_layer = None;
             }
             // AUD / FD / SEI: nothing to activate.
             _ => {}
@@ -837,11 +837,11 @@ impl SequenceDecoder {
         self.seen_picture = false;
         self.cvs_index = 0;
         self.au = AccessUnit::default();
+        self.state = PictureSequenceState::default();
         for layer in self.layers.values_mut() {
             *layer = LayerState::default();
         }
         self.packet_pts = None;
-        self.skipped_pts.clear();
         Ok(())
     }
 
@@ -861,10 +861,6 @@ impl SequenceDecoder {
         self.packet_pts = pts;
     }
 
-    /// Take any PTS values of pictures that were skipped or dropped without output.
-    pub fn take_skipped_pts(&mut self) -> Vec<i64> {
-        std::mem::take(&mut self.skipped_pts)
-    }
     /// Keep an output plane for later pictures once nothing else shares
     /// it (a shared one is simply released).
     pub(crate) fn recycle_plane(&mut self, plane: std::sync::Arc<Vec<u16>>) {
@@ -929,9 +925,6 @@ impl SequenceDecoder {
         // A RASL picture preceding any decoded picture in its layer cannot
         // be decoded either.
         if nal_kind.is_rasl() && (lstate.last_cra_no_rasl || !lstate.first_pic_decoded) {
-            if let Some(pts) = pic_pts {
-                self.skipped_pts.push(pts);
-            }
             return Ok(());
         }
         let plan = self.plan();
@@ -949,7 +942,6 @@ impl SequenceDecoder {
                 kind: "sps",
                 id: pps.sps_id,
             })?;
-        let layer_id = indep.layer_id;
         let vps = self.vps.get(&sps_raw.vps_id).filter(|_| plan.multi_layer);
         let ext = vps.and_then(|v| v.extension.as_ref());
         // F.7.4.3.2.1: a dependent (non-independent) layer takes its
@@ -1053,13 +1045,8 @@ impl SequenceDecoder {
                 .map(|e| e.poc)
                 .collect();
             for f in &mut self.frames {
-                if f.layer_id == layer_id && dpb_pocs.contains(&f.poc) {
-                    if f.output {
-                        f.output = false;
-                        if let Some(pts) = f.pts {
-                            self.skipped_pts.push(pts);
-                        }
-                    }
+                if f.layer_id == layer_id && dpb_pocs.contains(&f.poc) && f.output {
+                    f.output = false;
                 }
             }
             self.state.dpb_mut().unmark_layer(layer_id);
